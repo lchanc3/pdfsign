@@ -1,0 +1,14 @@
+services:
+  pdfsign:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: pdfsign
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    # 想換字型：把 .ttf 掛進來並指定路徑
+    # volumes:
+    #   - ./fonts/kai.ttf:/fonts/kai.ttf:ro
+    # environment:
+    #   - PDFSIGN_FONT=/fonts/kai.ttf

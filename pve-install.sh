@@ -6,10 +6,10 @@
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/lchanc3/pdfsign/main/pve-install.sh)"
 #
 # 可用環境變數（全部都有預設值）：
-#   CTID=201 CT_HOSTNAME=pdfsign DISK=8 CORES=1 RAM=1024
+#   CTID=201 CT_HOSTNAME=pdfsign DISK=8 CORES=1 RAM=512
 #   BRIDGE=vmbr0 IPV4=dhcp                       # 或 IPV4=10.0.0.50/24 GATEWAY=10.0.0.1
 #   STORAGE=local-lvm TEMPLATE_STORAGE=local
-#   PORT=8080 PASSWORD=<自訂 root 密碼> VERBOSE=1
+#   PORT=80 PASSWORD=<自訂 root 密碼> VERBOSE=1
 #
 set -euo pipefail
 
@@ -48,11 +48,11 @@ CTID=${CTID:-$(pvesh get /cluster/nextid)}
 CT_HOSTNAME=${CT_HOSTNAME:-pdfsign}
 DISK=${DISK:-8}
 CORES=${CORES:-1}
-RAM=${RAM:-1024}
+RAM=${RAM:-512}
 BRIDGE=${BRIDGE:-vmbr0}
 IPV4=${IPV4:-dhcp}
 GATEWAY=${GATEWAY:-}
-PORT=${PORT:-8080}
+PORT=${PORT:-80}
 PASSWORD=${PASSWORD:-$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | head -c 16)}
 
 pct status "$CTID" &>/dev/null && die "CTID $CTID 已被使用，換一個：CTID=xxx bash $0"
@@ -148,11 +148,13 @@ pct exec "$CTID" -- env PDFSIGN_PORT="$PORT" VERBOSE="$VERBOSE" \
 # ---------------------------------------------------------------- 完成
 
 IP=$(pct exec "$CTID" -- hostname -I 2>/dev/null | awk '{print $1}')
+URL="http://${IP}"
+if [[ $PORT != 80 ]]; then URL="${URL}:${PORT}"; fi
 
 echo
 ok "安裝完成"
 echo
-echo "  網址       http://${IP}:${PORT}"
+echo "  網址       $URL"
 echo "  容器       $CTID（$CT_HOSTNAME）"
 echo "  root 密碼   $PASSWORD"
 echo

@@ -41,10 +41,10 @@ CTID=201 RAM=2048 IPV4=10.0.0.50/24 GATEWAY=10.0.0.1 \
 |---|---|---|
 | `CTID` | 自動取下一個 | 容器編號 |
 | `CT_HOSTNAME` | `pdfsign` | 主機名稱 |
-| `DISK` / `CORES` / `RAM` | `8` / `1` / `1024` | 磁碟 GiB、核心數、記憶體 MB |
+| `DISK` / `CORES` / `RAM` | `8` / `1` / `512` | 磁碟 GiB、核心數、記憶體 MB |
 | `BRIDGE` / `IPV4` / `GATEWAY` | `vmbr0` / `dhcp` / — | 網路。靜態 IP 用 `IPV4=10.0.0.50/24` |
 | `STORAGE` | 自動偵測 | 容器磁碟要放的儲存 |
-| `PORT` | `8080` | 服務 port |
+| `PORT` | `80` | 服務 port |
 
 ### Debian / Ubuntu / 既有的 LXC
 
@@ -122,8 +122,10 @@ journalctl -u pdfsign -n 50
 
 | 變數 | 預設 | 說明 |
 |---|---|---|
-| `PDFSIGN_PORT` | `8080` | 監聽的 port |
+| `PDFSIGN_PORT` | `80` | 監聽的 port |
 | `PDFSIGN_FONT` | 自動尋找 | 指定字型檔路徑 |
+| `PDFSIGN_WORK_DIR` | `/var/lib/pdfsign` | 上傳檔的暫存目錄 |
+| `PDFSIGN_TTL_DAYS` | `7` | 暫存檔保留幾天 |
 
 ---
 
@@ -131,8 +133,9 @@ journalctl -u pdfsign -n 50
 
 **沒有內建認證。** 適合內網自用。要對外或多人共用，請自行加反向代理與認證。
 
-**上傳的檔案暫存在系統 temp 目錄**（`/tmp/pdfsign`），按「換一份」會刪除，
-其餘會在重開機時隨 `/tmp` 清空。長期運行建議加個定期清理。
+**上傳的檔案暫存在 `/var/lib/pdfsign`**，按「換一份」會立刻刪除，
+其餘超過 7 天會在下次上傳時自動清掉（`PDFSIGN_TTL_DAYS` 可調）。
+不放 `/tmp` 是因為 `systemd-tmpfiles` 會連目錄一起清掉，服務跑久了上傳就會失敗。
 
 **這不是數位簽章。** 蓋上去的是文字，跟手寫簽名或蓋章一樣沒有防竄改能力。
 需要密碼學保證的話請用 X.509 憑證做 PDF digital signature。

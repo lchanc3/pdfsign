@@ -7,7 +7,7 @@
 
 執行：
     python3 app.py
-    然後瀏覽 http://<ip>:8080
+    然後瀏覽 http://<ip>
 """
 
 import io
@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import uuid
 from datetime import date
 from functools import lru_cache
@@ -33,10 +34,37 @@ FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/custom/kaiu.ttf",
 ]
 
-PORT = int(os.environ.get("PDFSIGN_PORT", "8080"))
+PORT = int(os.environ.get("PDFSIGN_PORT", "80"))
 RENDER_ZOOM = 2.0
-WORK_DIR = Path(tempfile.gettempdir()) / "pdfsign"
-WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+# 上傳的 PDF 暫存在這裡。不放 /tmp：systemd-tmpfiles 會連目錄一起清掉，
+# 服務跑久了就會在寫檔的時候炸出 500。
+# 在 Windows 上 "/var/lib/pdfsign" 會被解析成 C:\var\lib\pdfsign 而且真的建得起來，
+# 所以這個候選只在 POSIX 上放進去，開發機才會乖乖退回 temp
+WORK_DIR_CANDIDATES = (["/var/lib/pdfsign"] if os.name == "posix" else []) + [
+    str(Path(tempfile.gettempdir()) / "pdfsign")
+]
+WORK_TTL_DAYS = float(os.environ.get("PDFSIGN_TTL_DAYS", "7"))
+
+
+def find_work_dir() -> Path:
+    # systemd 的 StateDirectory= 會把建好的路徑放進 STATE_DIRECTORY
+    override = os.environ.get("PDFSIGN_WORK_DIR") or os.environ.get("STATE_DIRECTORY")
+    for candidate in [override] if override else WORK_DIR_CANDIDATES:
+        path = Path(candidate)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".probe"
+            probe.write_bytes(b"")
+            probe.unlink()
+            return path
+        except OSError as e:
+            if override:
+                raise RuntimeError(f"暫存目錄無法寫入：{path}（{e.strerror or e}）") from e
+    raise RuntimeError("找不到可寫的暫存目錄，請用 PDFSIGN_WORK_DIR 指定一個")
+
+
+WORK_DIR = find_work_dir()
 
 
 def find_font() -> str:
@@ -116,6 +144,28 @@ class SignRequest(BaseModel):
     placements: list[Placement]
 
 
+_last_sweep = 0.0
+
+
+def sweep(force: bool = False) -> None:
+    """清掉過期的暫存檔。離開 /tmp 之後沒有系統幫忙清，得自己來。"""
+    global _last_sweep
+    now = time.time()
+    if not force and now - _last_sweep < 3600:
+        return
+    _last_sweep = now
+    cutoff = now - WORK_TTL_DAYS * 86400
+    for old in WORK_DIR.glob("*.pdf"):
+        try:
+            if old.stat().st_mtime < cutoff:
+                old.unlink()
+        except OSError:  # 別人正在用或已經不在了，下次再說
+            pass
+
+
+sweep(force=True)
+
+
 def doc_path(doc_id: str) -> Path:
     safe = uuid.UUID(doc_id)  # 非合法 UUID 會直接丟例外
     path = WORK_DIR / f"{safe}.pdf"
@@ -138,8 +188,15 @@ async def upload(file: UploadFile = File(...)):
     if doc.page_count == 0:
         raise HTTPException(400, "這份 PDF 沒有任何頁面")
 
+    sweep()
+
     doc_id = str(uuid.uuid4())
-    (WORK_DIR / f"{doc_id}.pdf").write_bytes(raw)
+    try:
+        # 目錄仍可能被人為刪掉或掛載點跑掉，寫之前先確保它在
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        (WORK_DIR / f"{doc_id}.pdf").write_bytes(raw)
+    except OSError as e:
+        raise HTTPException(500, f"暫存檔寫入失敗：{e.strerror or e}")
 
     pages = [
         {"width": round(p.rect.width, 2), "height": round(p.rect.height, 2)}
@@ -338,6 +395,8 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   flex-direction: column;
   overflow: hidden;
 }
+/* display 會蓋掉 [hidden] 的預設 display:none，得自己補回來 */
+.panel[hidden] { display: none; }
 
 /* ---------- 起始畫面 ---------- */
 
@@ -364,6 +423,25 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   transition: border-color .15s, background .15s;
 }
 .drop.over { border-color: var(--seal); background: var(--seal-wash); }
+
+/* 拖檔進來時整個視窗都是放置區，這層只是視覺提示 */
+body.dropping::after {
+  content: '放開以開啟';
+  position: fixed;
+  inset: .75rem;
+  z-index: 50;
+  pointer-events: none;
+  border: 2px dashed var(--seal);
+  border-radius: 6px;
+  background: var(--seal-wash);
+  display: grid;
+  place-items: center;
+  font-family: var(--kai);
+  font-size: 1.8rem;
+  letter-spacing: .18em;
+  text-indent: .18em;
+  color: var(--seal);
+}
 
 /* ---------- 頁面 ---------- */
 
@@ -537,7 +615,7 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
       <p>開啟 PDF，在要簽的位置點一下。輸出是可選取的文字，不是圖片。</p>
       <div class="drop" id="drop">
         <button class="primary" id="pick">選擇 PDF</button>
-        <p style="margin:.9rem 0 0;font-size:.85rem;color:var(--ink-faint)">或把檔案拖到這裡</p>
+        <p style="margin:.9rem 0 0;font-size:.85rem;color:var(--ink-faint)">或把檔案拖進視窗任何地方</p>
       </div>
     </div>
   </main>
@@ -615,14 +693,50 @@ const state = {
 $('#pick').onclick = () => $('#file').click();
 $('#file').onchange = e => { if (e.target.files[0]) load(e.target.files[0]); };
 
+// 放置區是整個視窗，不只那個虛線框。
+// dragenter/dragleave 會隨著游標經過每個子元素連續觸發，用深度計數才不會閃。
 const drop = $('#drop');
-['dragenter','dragover'].forEach(ev =>
-  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
-['dragleave','drop'].forEach(ev =>
-  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
-drop.addEventListener('drop', e => {
+let dragDepth = 0;
+
+const isFileDrag = e => Array.from(e.dataTransfer?.types || []).includes('Files');
+
+function endDrag() {
+  dragDepth = 0;
+  document.body.classList.remove('dropping');
+  drop.classList.remove('over');
+}
+
+document.addEventListener('dragenter', e => {
+  if (!isFileDrag(e) || state.doc) return;
+  e.preventDefault();
+  if (++dragDepth === 1) {
+    document.body.classList.add('dropping');
+    drop.classList.add('over');
+  }
+});
+
+// dragover 不擋掉的話 drop 根本不會觸發，瀏覽器會直接開啟那份 PDF 把畫面換掉
+document.addEventListener('dragover', e => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = state.doc ? 'none' : 'copy';
+});
+
+document.addEventListener('dragleave', e => {
+  if (!isFileDrag(e)) return;
+  if (--dragDepth <= 0) endDrag();
+});
+
+document.addEventListener('drop', e => {
+  if (!isFileDrag(e)) return;   // 拖文字到輸入框之類的，讓瀏覽器自己處理
+  e.preventDefault();
+  endDrag();
+  if (state.doc) return;        // 已經開著一份，不讓拖放把它蓋掉
   const f = e.dataTransfer.files[0];
-  if (f && f.type === 'application/pdf') load(f);
+  if (!f) return;
+  // 某些系統拖過來的 type 是空的，退回看副檔名
+  if (f.type === 'application/pdf' || /\.pdf$/i.test(f.name)) load(f);
+  else toast('只能開啟 PDF');
 });
 
 async function load(file) {

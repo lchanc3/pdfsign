@@ -2,12 +2,12 @@
 # 在 Debian / Ubuntu（含 Proxmox LXC）安裝簽章工具並設為系統服務。
 #   sudo bash install.sh
 #
-# 環境變數：PDFSIGN_DIR（預設 /opt/pdfsign）、PDFSIGN_PORT（預設 8080）
+# 環境變數：PDFSIGN_DIR（預設 /opt/pdfsign）、PDFSIGN_PORT（預設 80）
 #           VERBOSE=1 顯示完整安裝過程
 set -euo pipefail
 
 DIR=${PDFSIGN_DIR:-/opt/pdfsign}
-PORT=${PDFSIGN_PORT:-8080}
+PORT=${PDFSIGN_PORT:-80}
 VERBOSE=${VERBOSE:-0}
 SRC=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 
@@ -64,6 +64,8 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$DIR
+# 暫存的 PDF 放 /var/lib/pdfsign；systemd 會建好目錄並把路徑放進 STATE_DIRECTORY
+StateDirectory=pdfsign
 Environment=PDFSIGN_PORT=$PORT
 ExecStart=$DIR/venv/bin/python $DIR/pdfsign.py
 Restart=on-failure
@@ -84,7 +86,9 @@ done
 
 if systemctl is-active --quiet pdfsign; then
   IP=$(hostname -I | awk '{print $1}')
-  printf '  \033[32m✓\033[0m 服務已啟動   http://%s:%s\n' "$IP" "$PORT"
+  URL="http://$IP"
+  if [[ $PORT != 80 ]]; then URL="$URL:$PORT"; fi
+  printf '  \033[32m✓\033[0m 服務已啟動   %s\n' "$URL"
 else
   echo "服務沒有起來：journalctl -u pdfsign -n 40 --no-pager" >&2
   exit 1

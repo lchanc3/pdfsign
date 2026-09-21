@@ -85,6 +85,11 @@ def find_font() -> str:
 FONT_PATH = find_font()
 FONT = pymupdf.Font(fontfile=FONT_PATH)
 
+# 字型檔換掉、或子集化的方式改了，瀏覽器不該繼續吃快取裡的舊字型（max-age 一天）。
+# 尾巴那個數字是子集化邏輯的版本，改到 webfont() 就把它加一。
+_font_stat = Path(FONT_PATH).stat()
+FONT_TAG = f"{int(_font_stat.st_mtime)}-{_font_stat.st_size}-2"
+
 # 楷體全字庫超過 50MB，直接當 webfont 送給瀏覽器會拖垮渲染，
 # 所以只把畫面上實際用到的字子集化後送出（通常幾十 KB）。
 try:
@@ -112,7 +117,11 @@ def webfont(chars: str) -> bytes:
     opts.notdef_outline = True
     opts.recalc_bounds = False
     opts.ignore_missing_unicodes = True
-    font = TTFont(FONT_PATH)
+    # recalcBBoxes=False 很重要：fontTools 存檔時會重算每個字的 bbox，但不會跟著
+    # 更新 hmtx 的 lsb。楷體這類「bbox 記成整個 em 方框」的字型一重算就對不起來，
+    # 而 FreeType / Skia 會把字形平移 (lsb - xMin) 來補，結果畫面上每個中文字都往
+    # 右偏 0.4em，跟 PDF 實際輸出的位置對不上。原樣搬過去就不會有這個落差。
+    font = TTFont(FONT_PATH, recalcBBoxes=False)
     sub = Subsetter(options=opts)
     sub.populate(text=chars or SEED_CHARS)
     sub.subset(font)
@@ -852,6 +861,7 @@ function addMark(page, x, y) {
 // ---------- 楷體子集：只載入畫面上真正用到的字 ----------
 
 const SEED = __SEED__;
+const FONT_TAG = __FONTTAG__;
 const KAI = { loaded: new Set(), queue: new Set(), pending: false,
               composing: false, timer: 0 };
 
@@ -877,7 +887,7 @@ function loadFont() {
     .map(ch => 'U+' + ch.codePointAt(0).toString(16).toUpperCase())
     .join(',');
 
-  fetch('/font.ttf?chars=' + encodeURIComponent(chunk.join('')))
+  fetch('/font.ttf?v=' + FONT_TAG + '&chars=' + encodeURIComponent(chunk.join('')))
     .then(r => r.ok ? r.arrayBuffer() : Promise.reject())
     .then(buf => new FontFace('TWKai', buf, { unicodeRange: range }).load())
     .then(face => {
@@ -1176,7 +1186,10 @@ refreshFont();
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return INDEX.replace("__SEED__", json.dumps(SEED_CHARS, ensure_ascii=False))
+    return (
+        INDEX.replace("__SEED__", json.dumps(SEED_CHARS, ensure_ascii=False))
+        .replace("__FONTTAG__", json.dumps(FONT_TAG))
+    )
 
 
 if __name__ == "__main__":

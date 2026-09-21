@@ -7,8 +7,10 @@ services:
     ports:
       - "80:8080"
     restart: unless-stopped
-    # 想換字型：把 .ttf 掛進來並指定路徑
     # volumes:
+    #   # 啟用外掛（規則檔改完 docker restart pdfsign 就生效）
+    #   - ../plugins:/app/plugins
+    #   # 換字型：把 .ttf 掛進來，再用下面的 PDFSIGN_FONT 指路徑
     #   - ./fonts/kai.ttf:/fonts/kai.ttf:ro
     # environment:
     #   - PDFSIGN_FONT=/fonts/kai.ttf

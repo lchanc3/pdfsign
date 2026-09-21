@@ -10,6 +10,7 @@
 #   BRIDGE=vmbr0 IPV4=dhcp                       # 或 IPV4=10.0.0.50/24 GATEWAY=10.0.0.1
 #   STORAGE=local-lvm TEMPLATE_STORAGE=local
 #   PORT=80 PASSWORD=<自訂 root 密碼> VERBOSE=1
+#   PDFSIGN_PLUGINS=formfill                     # 要一起裝的外掛，逗號分隔
 #
 set -euo pipefail
 
@@ -53,6 +54,7 @@ BRIDGE=${BRIDGE:-vmbr0}
 IPV4=${IPV4:-dhcp}
 GATEWAY=${GATEWAY:-}
 PORT=${PORT:-80}
+PLUGINS=${PDFSIGN_PLUGINS:-}
 PASSWORD=${PASSWORD:-$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | head -c 16)}
 
 pct status "$CTID" &>/dev/null && die "CTID $CTID 已被使用，換一個：CTID=xxx bash $0"
@@ -132,17 +134,31 @@ pct exec "$CTID" -- mkdir -p /opt/pdfsign-src
 TMPDIR_LOCAL=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_LOCAL"' EXIT
 
-for f in pdfsign.py requirements.txt install.sh; do
+FILES="pdfsign.py requirements.txt install.sh"
+
+# 外掛：規則檔可有可無，抓不到就讓外掛用內建預設
+if [[ -n $PLUGINS ]]; then
+  pct exec "$CTID" -- mkdir -p /opt/pdfsign-src/plugins
+  mkdir -p "$TMPDIR_LOCAL/plugins"
+  for n in ${PLUGINS//,/ }; do
+    FILES="$FILES plugins/$n.py plugins/$n.rules.jsonc plugins/$n.rules.json"
+  done
+fi
+
+for f in $FILES; do
   if [[ -n $SELF_DIR && -f "$SELF_DIR/$f" ]]; then
     run pct push "$CTID" "$SELF_DIR/$f" "/opt/pdfsign-src/$f"
-  else
-    curl -fsSL "$RAW/$f" -o "$TMPDIR_LOCAL/$f" || die "下載 $f 失敗（RAW=$RAW）"
+  elif curl -fsSL "$RAW/$f" -o "$TMPDIR_LOCAL/$f" 2>/dev/null; then
     run pct push "$CTID" "$TMPDIR_LOCAL/$f" "/opt/pdfsign-src/$f"
+  elif [[ $f == *.rules.json || $f == *.rules.jsonc ]]; then
+    :
+  else
+    die "取得 $f 失敗（RAW=$RAW）"
   fi
 done
 ok "程式檔已傳入"
 
-pct exec "$CTID" -- env PDFSIGN_PORT="$PORT" VERBOSE="$VERBOSE" \
+pct exec "$CTID" -- env PDFSIGN_PORT="$PORT" PDFSIGN_PLUGINS="$PLUGINS" VERBOSE="$VERBOSE" \
   bash /opt/pdfsign-src/install.sh
 
 # ---------------------------------------------------------------- 完成

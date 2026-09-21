@@ -3,11 +3,13 @@
 #   sudo bash install.sh
 #
 # 環境變數：PDFSIGN_DIR（預設 /opt/pdfsign）、PDFSIGN_PORT（預設 80）
+#           PDFSIGN_PLUGINS=formfill 要一起裝的外掛（逗號分隔，all 代表全部）
 #           VERBOSE=1 顯示完整安裝過程
 set -euo pipefail
 
 DIR=${PDFSIGN_DIR:-/opt/pdfsign}
 PORT=${PDFSIGN_PORT:-80}
+PLUGINS=${PDFSIGN_PLUGINS:-}
 VERBOSE=${VERBOSE:-0}
 SRC=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
 
@@ -49,6 +51,32 @@ say "建立 $DIR"
 install -d "$DIR"
 install -m 644 "$SRC/pdfsign.py" "$DIR/pdfsign.py"
 install -m 644 "$SRC/requirements.txt" "$DIR/requirements.txt"
+install -d "$DIR/plugins"
+
+# 外掛是選用的。之後想加，重跑一次 install.sh 並帶上 PDFSIGN_PLUGINS 即可；
+# 已經存在的規則檔不覆蓋，免得把改過的設定洗掉。
+if [[ -n $PLUGINS ]]; then
+  if [[ $PLUGINS == all ]]; then
+    NAMES=$(cd "$SRC/plugins" 2>/dev/null && ls *.py 2>/dev/null | sed 's/\.py$//')
+  else
+    NAMES=${PLUGINS//,/ }
+  fi
+  for n in $NAMES; do
+    [[ -f "$SRC/plugins/$n.py" ]] || { echo "找不到外掛：$SRC/plugins/$n.py"; exit 1; }
+    say "外掛 $n"
+    install -m 644 "$SRC/plugins/$n.py" "$DIR/plugins/$n.py"
+    # 規則檔只在對面一份都沒有的時候才放。既有的那份不覆蓋，也不要放一個
+    # 新副檔名的進去把它蓋過去（.jsonc 會優先於 .json 被讀取）。
+    if ! compgen -G "$DIR/plugins/$n.rules.json*" >/dev/null; then
+      for r in "$SRC/plugins/$n.rules.jsonc" "$SRC/plugins/$n.rules.json"; do
+        if [[ -f $r ]]; then
+          install -m 644 "$r" "$DIR/plugins/${r##*/}"
+          break
+        fi
+      done
+    fi
+  done
+fi
 
 say "建立 venv 並安裝相依套件"
 run python3 -m venv "$DIR/venv"

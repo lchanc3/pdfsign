@@ -10,6 +10,7 @@
     然後瀏覽 http://<ip>
 """
 
+import importlib.util
 import io
 import json
 import os
@@ -321,6 +322,62 @@ def today():
     d = date.today()
     return {"roc": f"民國{d.year - 1911}年{d.month}月{d.day}日",
             "short": f"{d.year - 1911}.{d.month:02d}.{d.day:02d}"}
+
+
+# ---------------------------------------------------------------- 外掛
+
+# plugins/*.py 是選用功能：裝了才有，沒裝核心完全不知道它存在。
+# 一個外掛可以提供：
+#   setup(ctx)   啟動時呼叫一次，ctx 帶著 app、doc_path、字型等核心資源
+#   router       APIRouter，會掛進 app
+#   CLIENT_JS    注入首頁的前端程式碼，在核心 script 之後執行
+#   SEED_CHARS   外掛介面用到的字，併進 webfont 的預設子集
+
+PLUGIN_DIR = Path(
+    os.environ.get("PDFSIGN_PLUGIN_DIR", Path(__file__).resolve().parent / "plugins")
+)
+
+PLUGIN_SCRIPTS: list[str] = []
+PLUGIN_NAMES: list[str] = []
+
+
+class PluginContext:
+    """外掛要用的核心資源。外掛不要反過來 import 主程式。"""
+
+    def __init__(self) -> None:
+        self.app = app
+        self.doc_path = doc_path
+        self.font = FONT
+        self.font_path = FONT_PATH
+        self.work_dir = WORK_DIR
+
+
+def load_plugins() -> None:
+    global SEED_CHARS
+    if not PLUGIN_DIR.is_dir():
+        return
+    ctx = PluginContext()
+    for path in sorted(PLUGIN_DIR.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(
+                f"pdfsign_plugin_{path.stem}", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            if hasattr(mod, "setup"):
+                mod.setup(ctx)
+            if getattr(mod, "router", None) is not None:
+                app.include_router(mod.router)
+            if getattr(mod, "CLIENT_JS", ""):
+                PLUGIN_SCRIPTS.append(mod.CLIENT_JS)
+            SEED_CHARS += getattr(mod, "SEED_CHARS", "")
+            PLUGIN_NAMES.append(path.stem)
+        except Exception as e:  # 外掛壞掉不該讓整個服務起不來
+            print(f"外掛 {path.name} 載入失敗：{e}")
+
+
+load_plugins()
 
 
 # ---------------------------------------------------------------- 前端
@@ -774,6 +831,7 @@ async function load(file) {
   refreshFont();
   renderPages();
   renderList();
+  document.dispatchEvent(new CustomEvent('pdfsign:loaded'));
 }
 
 // ---------- 頁面 ----------
@@ -803,7 +861,12 @@ function renderPages() {
       if (state.dragging) { state.dragging = false; return; }
       if (e.target.closest('.mark')) return;
       const b = sheet.getBoundingClientRect();
-      addMark(i, (e.clientX - b.left) / b.width, (e.clientY - b.top) / b.height);
+      const x = (e.clientX - b.left) / b.width, y = (e.clientY - b.top) / b.height;
+      // 外掛可以攔掉這一下（例如填表模式不該順手蓋章）
+      const place = new CustomEvent('pdfsign:place',
+                                   { detail: { page: i, x, y }, cancelable: true });
+      if (!document.dispatchEvent(place)) return;
+      addMark(i, x, y);
     });
 
     stage.appendChild(sheet);
@@ -992,6 +1055,8 @@ function drawMarks() {
       box.setAttribute('height', b.height + 6);
     });
   });
+
+  document.dispatchEvent(new CustomEvent('pdfsign:drawn'));
 }
 
 function startDrag(ev, i, sheet) {
@@ -1179,6 +1244,7 @@ addEventListener('resize', () => {
 // 介面本身也要楷體（標題、快捷鍵、清單）
 refreshFont();
 </script>
+__PLUGINS__
 </body>
 </html>
 """
@@ -1186,9 +1252,11 @@ refreshFont();
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    scripts = "\n".join(f"<script>{js}</script>" for js in PLUGIN_SCRIPTS)
     return (
         INDEX.replace("__SEED__", json.dumps(SEED_CHARS, ensure_ascii=False))
         .replace("__FONTTAG__", json.dumps(FONT_TAG))
+        .replace("__PLUGINS__", scripts)
     )
 
 
@@ -1196,5 +1264,7 @@ if __name__ == "__main__":
     import uvicorn
 
     print(f"字型：{FONT_PATH}")
+    if PLUGIN_NAMES:
+        print(f"外掛：{'、'.join(PLUGIN_NAMES)}")
     print(f"啟動於 http://0.0.0.0:{PORT}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")

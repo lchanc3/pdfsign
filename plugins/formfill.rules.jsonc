@@ -1,0 +1,77 @@
+// formfill 的偵測規則。JSONC：可以寫註解，結尾多一個逗號也沒關係。
+// 改完存檔即生效，不用重開服務。寫錯的地方會直接顯示在側欄。
+//
+// label   錨定用的文字，要跟 PDF 裡印的一樣（空白會自動忽略）。
+//         給陣列可以當別名：["承辦人", "承辦單位"]
+// slots   由左到右列出每個空格，每個指定「填在哪裡」和「填什麼」。
+//
+//   填在哪裡
+//     "before": "年"   填在這個字左邊的空白，預設右對齊 → 「115 年」
+//     "after":  "："   填在這個字右邊的空白，預設左對齊 → 「：王小明」
+//     兩個都不給        接在標籤後面，會自動跳過緊接的冒號
+//     "align"          left / center / right，覆寫上面的預設
+//   往右填的時候，後面緊接的底線或點線（＿﹍─…）算是畫出來的填寫欄，
+//   字會寫在那條線上面，而不是擠在它前面。
+//
+//   填什麼
+//     "value"    roc_year year month day hour minute second
+//                roc_date（民國115年9月21日）roc_short（115.09.21）text
+//     "text"     value 是 text 時要填的固定字串
+//     "digits"   數字補零到幾位，月日時分秒預設 2、年預設 1
+//
+//   其他
+//     "optional": true   找不到這個錨點也算命中
+//                        （預設是少一個就整條跳過，這樣結構相近的鄰列才不會被誤填）
+
+{
+  "rules": [
+    {
+      "id": "abnormal-clear",
+      "name": "異常排除時間",
+      "label": "異常排除時間",
+      "slots": [
+        { "before": "年", "value": "roc_year" },
+        { "before": "月", "value": "month" },
+        { "before": "日", "value": "day" },
+        { "before": "時", "value": "hour" },
+        { "before": "分", "value": "minute" },
+      ],
+    },
+
+    // ---- 以下是範例，要用就把註解拿掉 ----
+
+    // 填在冒號右邊的固定文字
+    // {
+    //   "id": "handler",
+    //   "label": ["承辦人", "承辦單位"],
+    //   "slots": [ { "after": "：", "value": "text", "text": "王小明" } ]
+    // },
+
+    // 不指定錨點：接在標籤後面（冒號會自動跳過），置中在那段空白裡
+    // {
+    //   "id": "report-date",
+    //   "label": "填表日期",
+    //   "slots": [ { "value": "roc_date", "align": "center" } ]
+    // },
+
+    // 底線式的填寫欄：字會寫在線上面
+    // {
+    //   "id": "receiver",
+    //   "label": "簽收人",
+    //   "slots": [ { "value": "text", "text": "陳大文", "align": "center" } ]
+    // },
+
+    // 月日不補零，時分有就填、沒有也算命中
+    // {
+    //   "id": "date-only",
+    //   "label": "處理日期",
+    //   "slots": [
+    //     { "before": "年", "value": "roc_year" },
+    //     { "before": "月", "value": "month", "digits": 1 },
+    //     { "before": "日", "value": "day", "digits": 1 },
+    //     { "before": "時", "value": "hour", "optional": true },
+    //     { "before": "分", "value": "minute", "optional": true }
+    //   ]
+    // },
+  ]
+}

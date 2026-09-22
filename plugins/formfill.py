@@ -478,6 +478,16 @@ style.textContent = `
 .ff-hit.pre { background:transparent; outline:1px dashed var(--ink-faint);
               cursor:not-allowed; }
 .ff-gauge { position:absolute; width:0; height:0; overflow:hidden; }
+/* 填表模式下不能自己蓋章：常用戳章整排壓灰（inert 負責擋掉點擊與鍵盤），
+   游標也從十字改回箭頭，免得看起來還能點 */
+body.ff-on .presets { opacity:.4; }
+body.ff-on .sheet { cursor:default; }
+/* 核心的空狀態寫著「點一下就會放上一個簽章」，在這個模式下剛好相反 */
+body.ff-on .empty { display:none; }
+.ff-note { padding:.6rem 1.25rem; border-bottom:1px solid var(--line);
+           background:var(--seal-wash); color:var(--seal);
+           font-size:.82rem; line-height:1.5; }
+.ff-note b { font-weight:600; }
 `;
 document.head.appendChild(style);
 
@@ -487,7 +497,24 @@ bar.innerHTML =
   '<label class="ff-sw"><input type="checkbox" id="ffOn"><span>填表模式</span></label>' +
   '<button id="ffAll" disabled>全部填入</button>' +
   '<span class="ff-info" id="ffInfo"></span>';
-document.querySelector('.presets').insertAdjacentElement('afterend', bar);
+const presets = document.querySelector('.presets');
+presets.insertAdjacentElement('afterend', bar);
+
+// 點了沒反應是最難猜的，所以把「現在不能蓋章」直接寫出來
+const note = document.createElement('div');
+note.className = 'ff-note';
+note.hidden = true;
+note.innerHTML = '<b>填表模式已啟用</b>：只能點頁面上框出來的欄位。<br>' +
+                 '「簽名」與「文字」蓋章已停用。';
+bar.insertAdjacentElement('afterend', note);
+
+// inert 會連鍵盤與輔助技術一起擋掉，而且掛在容器上，
+// 核心重畫 chips（renderChips）也不會把它弄丟
+function mode() {
+  note.hidden = !FF.on;
+  presets.inert = FF.on;
+  document.body.classList.toggle('ff-on', FF.on);
+}
 
 // 量字寬用的隱形 SVG：楷體已經在瀏覽器裡，量得到就不會讓數字撐爆空格
 const gauge = document.createElementNS(SVGNS, 'svg');
@@ -600,6 +627,7 @@ async function scan() {
 
 $('#ffOn').onchange = async e => {
   FF.on = e.target.checked;
+  mode();
   if (FF.on && !FF.scanned) await scan();
   else if (!FF.on) info('');
   paint();
@@ -615,12 +643,17 @@ $('#ffAll').onclick = () => {
 };
 
 // 填表模式下不要順手蓋章
-document.addEventListener('pdfsign:place', e => { if (FF.on) e.preventDefault(); });
+document.addEventListener('pdfsign:place', e => {
+  if (!FF.on) return;
+  e.preventDefault();
+  toast('填表模式下不能自己蓋章，請點框出來的欄位，或關掉填表模式');
+});
 
 document.addEventListener('pdfsign:loaded', () => {
   FF.on = false; FF.scanned = false; FF.hits = [];
   $('#ffOn').checked = false;
   $('#ffAll').disabled = true;
+  mode();
   info('');
 });
 })();

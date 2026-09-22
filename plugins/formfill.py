@@ -539,7 +539,7 @@ function fill(h, when) {
     if (!text) return;
     state.marks.push({
       page: h.page, x: s.x, y: s.y,
-      name: text, dateText: '',
+      kind: 'text', name: text, dateText: '',
       nameSize: fit(text, s.size, s.gap), dateSize: 12, gap: 6,
       align: s.align, layout: 'stack',
       ffHit: h.id,        // 後端的 Placement 會忽略這個多出來的欄位

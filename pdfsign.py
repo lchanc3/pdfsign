@@ -38,6 +38,10 @@ FONT_CANDIDATES = [
 PORT = int(os.environ.get("PDFSIGN_PORT", "80"))
 RENDER_ZOOM = 2.0
 
+# 自由文字換行時的行距倍率。前端 LINE_FACTOR 要跟著一樣，
+# 不然畫面上看到的行距會跟輸出的 PDF 對不起來。
+LINE_FACTOR = 1.3
+
 # 上傳的 PDF 暫存在這裡。不放 /tmp：systemd-tmpfiles 會連目錄一起清掉，
 # 服務跑久了就會在寫檔的時候炸出 500。
 # 在 Windows 上 "/var/lib/pdfsign" 會被解析成 C:\var\lib\pdfsign 而且真的建得起來，
@@ -104,6 +108,7 @@ except ImportError:  # 沒裝也能跑，只是會退回送整支字型
 SEED_CHARS = (
     "簽章工具名日期無關僅對齊左緣置中右下方同行大小刪除這個下載好的換一份頁"
     "民國年月未填在上點一次就會放個開啟可選取搜尋文字不是圖片把檔案拖到裡"
+    "內容"
     "或選擇還沒有蓋任何請確認後端狀態與網路連線重試產生失敗已"
     "0123456789/.:-"
 )
@@ -257,28 +262,40 @@ def sign(req: SignRequest):
         page = doc[p.page]
         w, h = page.rect.width, page.rect.height
         px, py = p.x * w, p.y * h
-        name, dated = p.name.strip(), p.dateText.strip()
+        dated = p.dateText.strip()
+        # 自由文字可以換行。沒有換行時 lines 只有一行，行為跟以前一模一樣。
+        # 點到的位置永遠是第一行的基線，後面的行往下長。
+        lines = p.name.split("\n")
+        step = p.nameSize * LINE_FACTOR
+        base = py + step * (len(lines) - 1)   # 最後一行的基線，日期靠著它擺
 
         def put(text: str, x: float, y: float, size: float) -> None:
             page.insert_text((x, y), text, fontname=alias,
                              fontfile=FONT_PATH, fontsize=size, color=(0, 0, 0))
 
+        def put_line(text: str, y: float) -> None:
+            if text.strip():
+                put(text, start_at(width(text, p.nameSize), px, p.align),
+                    y, p.nameSize)
+
+        for i, line in enumerate(lines[:-1]):
+            put_line(line, py + step * i)
+
+        last = lines[-1]
         if p.layout == "inline":
             # 姓名與日期同一條基線，日期緊接在後（如：謝誠銓115/09/02）
-            wn = width(p.name, p.nameSize)
+            wn = width(last, p.nameSize)
             x0 = start_at(wn + width(p.dateText, p.dateSize), px, p.align)
-            if name:
-                put(p.name, x0, py, p.nameSize)
+            if last.strip():
+                put(last, x0, base, p.nameSize)
             if dated:
-                put(p.dateText, x0 + wn, py, p.dateSize)
+                put(p.dateText, x0 + wn, base, p.dateSize)
         else:
-            if name:
-                put(p.name, start_at(width(p.name, p.nameSize), px, p.align),
-                    py, p.nameSize)
+            put_line(last, base)
             if dated:
                 put(p.dateText,
                     start_at(width(p.dateText, p.dateSize), px, p.align),
-                    py + p.dateSize + p.gap, p.dateSize)
+                    base + p.dateSize + p.gap, p.dateSize)
 
     # 只嵌入實際用到的字，否則整支楷體（約 50MB）會被塞進檔案
     try:
@@ -414,7 +431,7 @@ html, body {
   line-height: 1.6;
 }
 
-button, input, select { font: inherit; color: inherit; }
+button, input, select, textarea { font: inherit; color: inherit; }
 
 button {
   cursor: pointer;
@@ -437,6 +454,14 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   border-color: var(--ink);
 }
 .primary:hover:not(:disabled) { background: #000; border-color: #000; }
+
+/* 已經「上膛」的刪除鍵：紅的，再按一下就真的刪 */
+.danger {
+  background: var(--seal);
+  color: #fff;
+  border-color: var(--seal);
+}
+.danger:hover:not(:disabled) { background: #94301F; border-color: #94301F; }
 
 /* ---------- 版面 ---------- */
 
@@ -643,6 +668,16 @@ body.dropping::after {
   background: #fff;
 }
 .field input[type=range] { width: 100%; }
+.field textarea {
+  width: 100%;
+  padding: .45rem .6rem;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: #fff;
+  line-height: 1.5;
+  resize: vertical;
+}
+.field .hint { margin: .3rem 0 0; font-size: .78rem; color: var(--ink-faint); }
 .pair { display: flex; gap: .75rem; }
 .pair > * { flex: 1; }
 .size-val { color: var(--ink-faint); font-variant-numeric: tabular-nums; }
@@ -698,10 +733,11 @@ body.dropping::after {
     <div class="list" id="list"></div>
     <div class="editor" id="editor" hidden>
       <div class="field">
-        <label for="fName">姓名</label>
-        <input type="text" id="fName" autocomplete="off">
+        <label for="fName" id="nameLabel">姓名</label>
+        <textarea id="fName" rows="1" autocomplete="off" spellcheck="false"></textarea>
+        <p class="hint" id="nameHint" hidden>按 Enter 換行</p>
       </div>
-      <div class="field">
+      <div class="field" id="dateField">
         <label for="fDate">日期</label>
         <input type="text" id="fDate" autocomplete="off">
       </div>
@@ -717,7 +753,7 @@ body.dropping::after {
                     title="文字右緣貼齊你點的位置，往左延伸">右緣</button>
           </div>
         </div>
-        <div class="field">
+        <div class="field" id="layoutField">
           <label id="layoutLabel">日期位置</label>
           <div class="seg" role="group" aria-labelledby="layoutLabel" id="segLayout">
             <button data-layout="stack" aria-pressed="true">下方</button>
@@ -727,10 +763,11 @@ body.dropping::after {
       </div>
       <div class="pair">
         <div class="field">
-          <label for="fNS">姓名大小 <span class="size-val" id="vNS"></span></label>
+          <label for="fNS"><span id="nsLabel">姓名大小</span>
+            <span class="size-val" id="vNS"></span></label>
           <input type="range" id="fNS" min="10" max="48" step="1">
         </div>
-        <div class="field">
+        <div class="field" id="dsField">
           <label for="fDS">日期大小 <span class="size-val" id="vDS"></span></label>
           <input type="range" id="fDS" min="7" max="28" step="1">
         </div>
@@ -739,7 +776,7 @@ body.dropping::after {
     </div>
     <div class="panel-foot">
       <button class="primary" id="save">下載簽好的 PDF</button>
-      <button id="reset">換一份</button>
+      <button id="reset">刪除</button>
     </div>
   </aside>
 </div>
@@ -750,9 +787,14 @@ body.dropping::after {
 const $ = s => document.querySelector(s);
 const state = {
   doc: null, pages: [], marks: [], sel: -1, roc: '', preset: 'sign', dragging: false,
-  tpl: { name: '', dateText: '', nameSize: 22, dateSize: 12,
+  // 簽名與自由文字各記各的，切換模式時不會互相蓋掉
+  signName: '', freeText: '無關',
+  tpl: { kind: 'sign', name: '', dateText: '', nameSize: 22, dateSize: 12,
          gap: 6, align: 'center', layout: 'stack' }
 };
+
+// 換行的行距倍率，跟後端的 LINE_FACTOR 必須一致
+const LINE_FACTOR = 1.3;
 
 // ---------- 上傳 ----------
 
@@ -878,13 +920,12 @@ function renderPages() {
 
 const PRESETS = [
   { id: 'sign', chip: '簽名', make: () => ({
-      name: state.tpl.name, dateText: state.roc,
+      kind: 'sign', name: state.signName, dateText: state.roc,
       nameSize: 22, dateSize: 12, gap: 6, align: 'center', layout: 'stack' }) },
-  { id: 'plain', chip: '僅簽名', make: () => ({
-      name: state.tpl.name, dateText: '',
-      nameSize: 22, dateSize: 12, gap: 6, align: 'center', layout: 'stack' }) },
-  { id: 'na', chip: '無關', make: () => ({
-      name: '無關', dateText: '',
+  // 自由文字：沒有日期、可以換行。原本的「僅簽名」與「無關」都是它的特例，
+  // 預設帶上一次寫過的內容（第一次是「無關」）
+  { id: 'text', chip: '文字', make: () => ({
+      kind: 'text', name: state.freeText, dateText: '',
       nameSize: 20, dateSize: 12, gap: 6, align: 'center', layout: 'stack' }) }
 ];
 
@@ -898,11 +939,14 @@ function renderChips() {
     b.onclick = () => {
       state.preset = p.id;
       const preset = p.make();
-      state.tpl = { ...state.tpl, ...preset };
-      // 有選取中的戳章就一起套用，符合「按了就看到變化」的預期
+      // 有選取中的戳章就一起套用，符合「按了就看到變化」的預期。
+      // 但換模式不該把已經寫好的字弄丟，空白的才吃範本帶來的預設內容。
       const m = state.marks[state.sel];
+      if (m && m.name) preset.name = m.name;
+      state.tpl = { ...state.tpl, ...preset };
       if (m) {
         Object.assign(m, preset);
+        rememberName(m);
         select(state.sel);
         state.preset = p.id;   // select() 不會動 preset，但編輯欄位會，這裡固定回來
       }
@@ -933,9 +977,10 @@ const KAI = { loaded: new Set(), queue: new Set(), pending: false,
 // 瀏覽器會逐字挑選——所以每次只需要下載「還沒有的字」。
 function neededChars() {
   const set = new Set(SEED);
-  const feed = str => { for (const ch of String(str || '')) set.add(ch); };
+  const feed = str => { for (const ch of String(str || '')) if (ch >= ' ') set.add(ch); };
   state.marks.forEach(m => { feed(m.name); feed(m.dateText); });
   feed(state.tpl.name); feed(state.tpl.dateText);
+  feed(state.signName); feed(state.freeText);
   return set;
 }
 
@@ -985,6 +1030,9 @@ function svgText(x, y, anchor) {
   t.setAttribute('x', x);
   t.setAttribute('y', y);              // y 就是基線，與 PDF 同義
   t.setAttribute('text-anchor', anchor);
+  // SVG 預設會把前後空白吃掉，輸出的 PDF 卻會照算。不保留的話，
+  // 用空白縮排的那一行在畫面上是置中的、在 PDF 裡卻往旁邊偏。
+  t.setAttributeNS('http://www.w3.org/XML/1998/namespace', 'xml:space', 'preserve');
   return t;
 }
 
@@ -1021,18 +1069,30 @@ function drawMarks() {
       const x = m.x * pg.width, y = m.y * pg.height;
       const anchor = ANCHOR[m.align] || 'middle';
 
+      // 空的戳章給一個全形空白撐住，不然選取框會縮成一條線
+      const lines = (m.name || '　').split('\n');
+      const step = m.nameSize * LINE_FACTOR;
+      const base = y + step * (lines.length - 1);   // 最後一行的基線
+      const last = lines[lines.length - 1];
+
+      lines.slice(0, -1).forEach((ln, li) => {
+        const t = svgText(x, y + step * li, anchor);
+        t.appendChild(span(ln, m.nameSize));
+        g.appendChild(t);
+      });
+
       if (m.layout === 'inline') {
-        // 同一條基線，日期緊接在姓名之後
-        const t = svgText(x, y, anchor);
-        t.appendChild(span(m.name || '　', m.nameSize));
+        // 同一條基線，日期緊接在最後一行之後
+        const t = svgText(x, base, anchor);
+        t.appendChild(span(last, m.nameSize));
         if (m.dateText) t.appendChild(span(m.dateText, m.dateSize));
         g.appendChild(t);
       } else {
-        const t1 = svgText(x, y, anchor);
-        t1.appendChild(span(m.name || '　', m.nameSize));
+        const t1 = svgText(x, base, anchor);
+        t1.appendChild(span(last, m.nameSize));
         g.appendChild(t1);
         if (m.dateText) {
-          const t2 = svgText(x, y + m.dateSize + m.gap, anchor);
+          const t2 = svgText(x, base + m.dateSize + m.gap, anchor);
           t2.appendChild(span(m.dateText, m.dateSize));
           g.appendChild(t2);
         }
@@ -1098,7 +1158,8 @@ function renderList() {
     row.innerHTML = `<span class="item-pg">p.${m.page + 1}</span>
                      <span class="item-nm"></span>
                      <span class="item-dt"></span>`;
-    row.querySelector('.item-nm').textContent = m.name || '未填姓名';
+    row.querySelector('.item-nm').textContent =
+      m.name.split('\n').join(' ') || (m.kind === 'text' ? '未填內容' : '未填姓名');
     row.querySelector('.item-dt').textContent = m.dateText;
     row.onclick = () => {
       select(i);
@@ -1109,12 +1170,37 @@ function renderList() {
   });
 }
 
-const TPL_KEYS = ['name','dateText','nameSize','dateSize','gap','align','layout'];
+const TPL_KEYS = ['kind','name','dateText','nameSize','dateSize','gap','align','layout'];
+
+// 簽名與自由文字各記各的，切回去時不會撿到另一邊的字
+function rememberName(m) {
+  if (m.kind === 'text') state.freeText = m.name; else state.signName = m.name;
+}
 
 function syncTpl(m) {
   TPL_KEYS.forEach(k => state.tpl[k] = m[k]);
+  rememberName(m);
   state.preset = null;
   renderChips();
+}
+
+// 自由文字沒有日期，相關欄位一併收起來，順手把措辭換成「內容」
+function applyKind(m) {
+  const free = m.kind === 'text';
+  $('#nameLabel').textContent = free ? '內容' : '姓名';
+  $('#nsLabel').textContent = free ? '文字大小' : '姓名大小';
+  $('#nameHint').hidden = !free;
+  $('#dateField').hidden = free;
+  $('#layoutField').hidden = free;
+  $('#dsField').hidden = free;
+  growName(m);
+}
+
+// 自由文字欄位跟著行數長高，最多六行
+function growName(m) {
+  $('#fName').rows = m.kind === 'text'
+    ? Math.min(6, Math.max(2, String(m.name || '').split('\n').length))
+    : 1;
 }
 
 function select(i) {
@@ -1122,6 +1208,7 @@ function select(i) {
   const m = state.marks[i];
   $('#editor').hidden = !m;
   if (m) {
+    applyKind(m);
     $('#fName').value = m.name;
     $('#fDate').value = m.dateText;
     $('#fNS').value = m.nameSize; $('#vNS').textContent = m.nameSize;
@@ -1160,8 +1247,14 @@ function edit(fn) {
   };
 }
 
-$('#fName').oninput = edit((m, v) => m.name = v);
+$('#fName').oninput = edit((m, v) => { m.name = v; growName(m); });
 $('#fDate').oninput = edit((m, v) => m.dateText = v);
+
+// 簽名只有一行，Enter 不該把它撐開；自由文字才讓 Enter 換行
+$('#fName').addEventListener('keydown', e => {
+  const m = state.marks[state.sel];
+  if (e.key === 'Enter' && (!m || m.kind !== 'text')) e.preventDefault();
+});
 
 // 中文輸入法組字中的注音／候選字不該被當成要載入的字
 ['#fName', '#fDate'].forEach(sel => {
@@ -1216,7 +1309,24 @@ $('#save').onclick = async () => {
   }
 };
 
+// 刪掉就沒了，第一下只「上膛」：10 秒內再按一次才真的刪，逾時自己復原
+const RESET = { timer: 0 };
+
+function disarmReset() {
+  clearTimeout(RESET.timer);
+  RESET.timer = 0;
+  $('#reset').textContent = '刪除';
+  $('#reset').classList.remove('danger');
+}
+
 $('#reset').onclick = () => {
+  if (!RESET.timer) {
+    $('#reset').textContent = '確認刪除';
+    $('#reset').classList.add('danger');
+    RESET.timer = setTimeout(disarmReset, 10000);
+    return;
+  }
+  disarmReset();
   if (state.doc) fetch('/api/doc/' + state.doc, { method: 'DELETE' });
   location.reload();
 };

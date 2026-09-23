@@ -55,7 +55,7 @@ sudo bash install.sh
 ```
 
 會安裝字型、建立 venv、設定 systemd 服務並啟動。
-要一併裝外掛：`sudo PDFSIGN_PLUGINS=formfill bash install.sh`
+要一併裝外掛：`sudo PDFSIGN_PLUGINS=formfill,retype bash install.sh`
 
 ### Docker
 
@@ -160,11 +160,42 @@ python3 -m venv venv
 舊的 `formfill.rules.json` 一樣讀得到（也吃註解），兩個都在時只會讀 `.jsonc`
 並在側欄提醒。安裝腳本不會覆蓋已經存在的規則檔，也不會在旁邊多放一份新的把它蓋過去。
 
+### retype — 修正原文
+
+改掉 PDF 上原本印好的字，例如打錯的日期、數字或單位名稱。
+
+打開側欄的「修正原文」之後，點頁面上的字就能在側欄改寫，頁面會即時預覽輸出後的樣子。
+改好的字跟戳章一樣先留在畫面上，按下載時才寫進 PDF：先拿掉原文（框線、底色、圖片都不動），
+再在同一條基線上寫新的字，最後才蓋章。
+
+**字型**：新字直接沿用文件裡原本的字型，所以字形、粗細跟原文一模一樣。
+但 PDF 裡嵌入的字型通常只含文件用過的字，原字型沒有的字只能換成替代字型，
+側欄會逐字標出來（加底線的就是替代字）。替代字型依序找：
+
+1. 系統裡同名的字型：把原文用的字型（例如 `kaiu.ttf`）放進 `/opt/pdfsign/plugins/fonts/`
+   再重開服務，缺的字也會一模一樣（只認 TrueType 的 `.ttf` / `.ttc`）
+2. 同風格的中文字型（楷／明／黑）
+3. 核心的楷體
+4. PDF 內建字型（英數字，例如 Times、Helvetica）
+
+改日期、數字這類小地方，通常原字型就有，或是替代字幾乎看不出來；
+寫原文沒出現過的中文字，又沒有對應的字型檔時，差異會比較明顯。
+
+**限制**
+
+- 掃描檔（沒有文字層）無法修改
+- 直書、旋轉的字，以及註解、表單欄位裡的字不能改
+- 新字寫在頁面內容的最後面，照內容順序複製整頁文字時，改過的字會排到最後；
+  依版面位置抽取文字（多數閱讀器的搜尋與選取）不受影響
+- 字數變多不會自動換行，也不會把後面的字往後推；字數不同時可以選靠左、置中或靠右對齊原文
+
+跟「填表模式」一樣，開著的時候不能蓋章；兩個模式同時只能開一個。
+
 ### 安裝與移除
 
 ```bash
 # 安裝時一起裝
-sudo PDFSIGN_PLUGINS=formfill bash install.sh
+sudo PDFSIGN_PLUGINS=formfill,retype bash install.sh
 
 # 之後再裝：重跑一次就好，已經改過的規則檔不會被覆蓋
 cd pdfsign && git pull && sudo PDFSIGN_PLUGINS=formfill bash install.sh

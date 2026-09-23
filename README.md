@@ -6,7 +6,6 @@
 > rasterised images) using a Traditional Chinese Kai font, with ROC-calendar
 > dates. Single-file Python app, no build step. UI is in Traditional Chinese.
 
-一個 Python 檔就是全部：前端 HTML/CSS/JS 都內嵌在 `pdfsign.py` 裡，沒有建置步驟。
 
 ---
 

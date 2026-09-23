@@ -114,26 +114,38 @@ SEED_CHARS = (
 )
 
 
-@lru_cache(maxsize=32)
-def webfont(chars: str) -> bytes:
-    if not HAVE_FONTTOOLS:
-        return Path(FONT_PATH).read_bytes()
+def subset_font(path: str, chars: str, index: int = 0) -> bytes:
+    """只留 chars 用得到的字，字符重新編號。需要 fontTools。
+
+    網頁字型和嵌進 PDF 的字型（戳章、外掛的替代字）共用這一支。嵌進 PDF 時一定要
+    先縮：整支字型嵌進去的話，MuPDF 會替整套字寫一份 ToUnicode，事後的
+    subset_fonts 只縮字型本體、不縮這張表，蓋幾個字檔案就多將近 100 KB。
+    """
     opts = SubsetOptions()
     opts.layout_features = []
     opts.notdef_outline = True
     opts.recalc_bounds = False
     opts.ignore_missing_unicodes = True
+    opts.drop_tables += ["meta"]     # 本來就會被丟掉，先講好免得每次都印警告
     # recalcBBoxes=False 很重要：fontTools 存檔時會重算每個字的 bbox，但不會跟著
     # 更新 hmtx 的 lsb。楷體這類「bbox 記成整個 em 方框」的字型一重算就對不起來，
     # 而 FreeType / Skia 會把字形平移 (lsb - xMin) 來補，結果畫面上每個中文字都往
     # 右偏 0.4em，跟 PDF 實際輸出的位置對不上。原樣搬過去就不會有這個落差。
-    font = TTFont(FONT_PATH, recalcBBoxes=False)
+    font = TTFont(path, recalcBBoxes=False,
+                  fontNumber=index if path.lower().endswith(".ttc") else -1)
     sub = Subsetter(options=opts)
-    sub.populate(text=chars or SEED_CHARS)
+    sub.populate(text=chars)
     sub.subset(font)
     buf = io.BytesIO()
     font.save(buf)
     return buf.getvalue()
+
+
+@lru_cache(maxsize=32)
+def webfont(chars: str) -> bytes:
+    if not HAVE_FONTTOOLS:
+        return Path(FONT_PATH).read_bytes()
+    return subset_font(FONT_PATH, chars or SEED_CHARS)
 
 app = FastAPI(title="簽章工具")
 
@@ -157,6 +169,7 @@ class Placement(BaseModel):
 class SignRequest(BaseModel):
     doc: str
     placements: list[Placement]
+    extra: dict = {}   # 外掛附帶的資料（前端 pdfsign:collect 收集），核心不看內容
 
 
 _last_sweep = 0.0
@@ -238,15 +251,31 @@ def page_image(doc_id: str, index: int):
 
 @app.post("/api/sign")
 def sign(req: SignRequest):
-    if not req.placements:
+    if not req.placements and not req.extra:
         raise HTTPException(400, "還沒有放上任何簽章")
 
     doc = pymupdf.open(doc_path(req.doc))
+
+    # 外掛先動原文（例如修正原文），戳章最後才蓋，才會疊在最上面
+    try:
+        for hook in BEFORE_SIGN:
+            hook(doc, req.extra)
+    except Exception:
+        doc.close()
+        raise
 
     # 每次簽署用不重複的字型別名。若沿用固定名稱，對「已經簽過一次」的檔案
     # 再簽時，PyMuPDF 會重用頁面裡既有的（已子集化的）字型資源而忽略 fontfile，
     # 導致新字沒有對應字符，輸出變成空白方框。
     alias = "kai" + uuid.uuid4().hex[:8]
+
+    # 先把戳章用得到的字做成子集再嵌。整支楷體嵌進去的話，MuPDF 會替整套字
+    # 寫一份 ToUnicode，事後的 subset_fonts 只縮字型本體、不縮這張表，
+    # 蓋幾個字檔案就多將近 100 KB（TW-Kai 字更多，多更多）
+    stamp_chars = "".join(sorted({ch for p in req.placements
+                                  for ch in p.name + p.dateText if not ch.isspace()}))
+    stamp_font = webfont(stamp_chars) if HAVE_FONTTOOLS and stamp_chars else None
+    font_ready: set[int] = set()
 
     def width(text: str, size: float) -> float:
         return FONT.text_length(text, size) if text else 0.0
@@ -269,9 +298,14 @@ def sign(req: SignRequest):
         step = p.nameSize * LINE_FACTOR
         base = py + step * (len(lines) - 1)   # 最後一行的基線，日期靠著它擺
 
+        if stamp_font and p.page not in font_ready:
+            page.insert_font(fontname=alias, fontbuffer=stamp_font)
+            font_ready.add(p.page)
+
         def put(text: str, x: float, y: float, size: float) -> None:
             page.insert_text((x, y), text, fontname=alias,
-                             fontfile=FONT_PATH, fontsize=size, color=(0, 0, 0))
+                             fontfile=None if stamp_font else FONT_PATH,
+                             fontsize=size, color=(0, 0, 0))
 
         def put_line(text: str, y: float) -> None:
             if text.strip():
@@ -303,8 +337,10 @@ def sign(req: SignRequest):
     except Exception:
         pass
 
+    # use_objstms：Word、Acrobat 存的檔多半把小物件包在壓縮過的物件串流裡，
+    # 不照做的話每個物件攤開成純文字，光重存一次就可能大上三成
     out = io.BytesIO()
-    doc.save(out, garbage=4, deflate=True)
+    doc.save(out, garbage=4, deflate=True, use_objstms=1)
     doc.close()
 
     return Response(
@@ -349,6 +385,19 @@ def today():
 #   router       APIRouter，會掛進 app
 #   CLIENT_JS    注入首頁的前端程式碼，在核心 script 之後執行
 #   SEED_CHARS   外掛介面用到的字，併進 webfont 的預設子集
+#
+# 輸出時介入：setup 裡 ctx.before_sign.append(fn)，fn(doc, extra) 會在蓋章之前
+# 拿到開好的文件。extra 是前端在 pdfsign:collect 事件裡塞進 detail.extra 的資料。
+# 要嵌字型進 PDF 的話先用 ctx.subset_font 縮過（沒裝 fontTools 時是 None）。
+#
+# 前端事件（都掛在 document 上）：
+#   pdfsign:loaded   開了一份新文件
+#   pdfsign:place    點頁面要蓋章，preventDefault() 可以攔掉
+#   pdfsign:drawn    戳章重畫完
+#   pdfsign:collect  要輸出了，把自己的資料放進 detail.extra
+#
+# 會接管頁面點擊的模式（填表、修正原文…）用 enterMode / leaveMode，
+# 同時只會有一個開著，戳章停用與攔截點擊都由核心處理。
 
 PLUGIN_DIR = Path(
     os.environ.get("PDFSIGN_PLUGIN_DIR", Path(__file__).resolve().parent / "plugins")
@@ -356,6 +405,7 @@ PLUGIN_DIR = Path(
 
 PLUGIN_SCRIPTS: list[str] = []
 PLUGIN_NAMES: list[str] = []
+BEFORE_SIGN: list = []
 
 
 class PluginContext:
@@ -367,6 +417,8 @@ class PluginContext:
         self.font = FONT
         self.font_path = FONT_PATH
         self.work_dir = WORK_DIR
+        self.before_sign = BEFORE_SIGN
+        self.subset_font = subset_font if HAVE_FONTTOOLS else None
 
 
 def load_plugins() -> None:
@@ -545,6 +597,39 @@ body.dropping::after {
 }
 .sheet img { display: block; width: 100%; height: auto; }
 
+/* 圖還沒回來之前，頁面照 PDF 的長寬比先佔好位置，捲軸長度一開始就對 */
+.sheet.loading::after,
+.sheet.failed::after {
+  content: '載入中…';
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--ink-faint);
+  font-size: .9rem;
+  pointer-events: none;
+}
+.sheet.failed::after { content: '這一頁載入失敗'; color: var(--seal); }
+
+/* 頁面還沒載完的提示：黏在可視範圍底部，不擋點擊 */
+.load-pill {
+  position: sticky;
+  bottom: 1rem;
+  z-index: 20;
+  flex-shrink: 0;
+  pointer-events: none;
+  background: var(--ink);
+  color: #fff;
+  opacity: .88;
+  padding: .4rem 1rem;
+  border-radius: 999px;
+  font-size: .82rem;
+  font-variant-numeric: tabular-nums;
+}
+.load-pill[hidden] { display: none; }
+/* 兩個都在的時候，toast 往上讓一點，不要疊在一起 */
+body.pages-loading .toast { bottom: 4.25rem; }
+
 .sheet-no {
   position: absolute;
   top: 0; left: -3.1rem;
@@ -607,6 +692,48 @@ body.dropping::after {
 .seg button + button { border-left: 1px solid var(--line); }
 .seg button[aria-pressed="true"] { background: var(--ink); color: #fff; }
 .seg button[aria-pressed="true"]:hover { background: #000; }
+
+/* ---------- 外掛 ---------- */
+
+/* 側欄的外掛開關列：左邊開關、右邊狀態，出錯時狀態自己佔一行 */
+.plugin-bar {
+  padding: .7rem 1.25rem;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: .7rem;
+  flex-wrap: wrap;
+}
+.plugin-switch {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  cursor: pointer;
+  font-size: .9rem;
+  user-select: none;
+  flex-shrink: 0;
+}
+.plugin-bar > button:not(.plugin-status) { padding: .25rem .6rem; font-size: .82rem; flex-shrink: 0; }
+.plugin-status {
+  margin-left: auto;
+  min-width: 0;
+  font-size: .78rem;
+  color: var(--ink-faint);
+  text-align: right;
+}
+.plugin-status.bad {
+  color: var(--seal);
+  flex: 1 0 100%;
+  margin-left: 0;
+  text-align: left;
+  line-height: 1.4;
+}
+
+/* 外掛接管點擊的模式：常用戳章壓灰、游標改回箭頭。
+   核心的空狀態寫著「點一下就會放上一個簽章」，這時候剛好相反，先藏起來 */
+body.mode-on .presets { opacity: .4; }
+body.mode-on .sheet { cursor: default; }
+body.mode-on .empty { display: none; }
 
 /* ---------- 側欄 ---------- */
 
@@ -857,6 +984,7 @@ async function load(file) {
   if (!r.ok) return toast((await r.json()).detail || '開啟失敗');
 
   const data = await r.json();
+  if (MODE.name) leaveMode(MODE.name, true);   // 換文件，上一份開著的模式收掉
   state.doc = data.doc;
   state.pages = data.pages;
   state.marks = [];
@@ -878,14 +1006,33 @@ async function load(file) {
 
 // ---------- 頁面 ----------
 
+let renderGen = 0;
+
 function renderPages() {
   const stage = $('#stage');
   stage.innerHTML = '';
+
+  // 頁數多的時候圖要一陣子才回得來，捲到已載入的最後一頁容易以為到底了，
+  // 所以在底部掛一個「後面還有」的提示，全部回來才拿掉
+  const gen = ++renderGen;
+  const total = state.pages.length;
+  let done = 0;
+  const pill = document.createElement('div');
+  pill.className = 'load-pill';
+  pill.setAttribute('role', 'status');
+  const tick = () => {
+    if (gen !== renderGen) return;      // 換了文件，舊頁的圖晚到不算
+    pill.textContent = `後面還有頁面，載入中 ${done} / ${total}`;
+    pill.hidden = done >= total;
+    document.body.classList.toggle('pages-loading', done < total);
+  };
+
   state.pages.forEach((pg, i) => {
     const sheet = document.createElement('div');
-    sheet.className = 'sheet';
+    sheet.className = 'sheet loading';
     sheet.dataset.page = i;
     sheet.style.width = Math.min(pg.width * 1.35, 900) + 'px';
+    sheet.style.aspectRatio = `${pg.width} / ${pg.height}`;
 
     const no = document.createElement('div');
     no.className = 'sheet-no';
@@ -893,9 +1040,11 @@ function renderPages() {
     sheet.appendChild(no);
 
     const img = document.createElement('img');
-    img.src = `/api/page/${state.doc}/${i}`;
     img.alt = `第 ${i + 1} 頁`;
     img.draggable = false;
+    img.onload = () => { sheet.classList.remove('loading'); done++; tick(); };
+    img.onerror = () => { sheet.classList.replace('loading', 'failed'); done++; tick(); };
+    img.src = `/api/page/${state.doc}/${i}`;
     sheet.appendChild(img);
 
     sheet.addEventListener('click', e => {
@@ -904,7 +1053,12 @@ function renderPages() {
       if (e.target.closest('.mark')) return;
       const b = sheet.getBoundingClientRect();
       const x = (e.clientX - b.left) / b.width, y = (e.clientY - b.top) / b.height;
-      // 外掛可以攔掉這一下（例如填表模式不該順手蓋章）
+      // 外掛的模式開著時不蓋章：先讓外掛處理，它不處理就提示為什麼點了沒反應
+      if (MODE.name) {
+        if (!(MODE.blocked && MODE.blocked({ page: i, x, y }))) toast(MODE.hint);
+        return;
+      }
+      // 外掛可以攔掉這一下
       const place = new CustomEvent('pdfsign:place',
                                    { detail: { page: i, x, y }, cancelable: true });
       if (!document.dispatchEvent(place)) return;
@@ -913,7 +1067,38 @@ function renderPages() {
 
     stage.appendChild(sheet);
   });
+  stage.appendChild(pill);
+  tick();
   drawMarks();
+}
+
+// ---------- 外掛的模式 ----------
+
+// 會接管頁面點擊的外掛（填表、修正原文…）同時只能開一個。開著的時候常用戳章
+// 停用、點頁面不蓋章，都由這裡統一處理，外掛只要說開或關。
+//   enterMode(name, { off, hint, blocked })
+//     off      被別的模式擠掉、或換了一份文件時呼叫，外掛在裡面把自己的畫面收起來
+//     hint     點到頁面上沒東西的地方時的提示
+//     blocked  同上，但先交給外掛處理；回傳 true 就不跳提示
+//   leaveMode(name)
+const MODE = { name: null, off: null, hint: '', blocked: null };
+
+function enterMode(name, opts = {}) {
+  if (MODE.name && MODE.name !== name) leaveMode(MODE.name, true);
+  Object.assign(MODE, { name, off: opts.off || null, hint: opts.hint || '',
+                        blocked: opts.blocked || null });
+  // inert 會連鍵盤與輔助技術一起擋掉，而且掛在容器上，重畫 chips 也不會弄丟
+  $('.presets').inert = true;
+  document.body.classList.add('mode-on');
+}
+
+function leaveMode(name, notify) {
+  if (MODE.name !== name) return;
+  const off = MODE.off;
+  Object.assign(MODE, { name: null, off: null, hint: '', blocked: null });
+  $('.presets').inert = false;
+  document.body.classList.remove('mode-on');
+  if (notify && off) off();
 }
 
 // ---------- 樣式範本：新戳章沿用目前設定 ----------
@@ -1285,14 +1470,18 @@ document.addEventListener('keydown', e => {
 // ---------- 輸出 ----------
 
 $('#save').onclick = async () => {
-  if (!state.marks.length) return toast('還沒有放上任何簽章');
+  // 外掛把自己要一起輸出的東西放進 extra（例如修正原文），後端交給對應的外掛
+  const collect = new CustomEvent('pdfsign:collect', { detail: { extra: {} } });
+  document.dispatchEvent(collect);
+  const extra = collect.detail.extra;
+  if (!state.marks.length && !Object.keys(extra).length) return toast('還沒有放上任何簽章');
   const btn = $('#save');
   btn.disabled = true; btn.textContent = '產生中…';
   try {
     const r = await fetch('/api/sign', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ doc: state.doc, placements: state.marks })
+      body: JSON.stringify({ doc: state.doc, placements: state.marks, extra })
     });
     if (!r.ok) throw new Error((await r.json()).detail || '產生失敗');
     const blob = await r.blob();

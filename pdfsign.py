@@ -914,8 +914,8 @@ body.mode-on .empty { display: none; }
 const $ = s => document.querySelector(s);
 const state = {
   doc: null, pages: [], marks: [], sel: -1, roc: '', preset: 'sign', dragging: false,
-  // 簽名與自由文字各記各的，切換模式時不會互相蓋掉
-  signName: '', freeText: '無關',
+  // 簽名與自由文字各記各的，切換模式時不會互相蓋掉；簽名的日期改過也記著
+  signName: '', signDate: '', freeText: '無關',
   tpl: { kind: 'sign', name: '', dateText: '', nameSize: 22, dateSize: 12,
          gap: 6, align: 'center', layout: 'stack' }
 };
@@ -992,6 +992,7 @@ async function load(file) {
 
   const t = await (await fetch('/api/today')).json();
   state.roc = t.roc;
+  state.signDate = t.roc;
   state.tpl.dateText = t.roc;
   renderChips();
 
@@ -1105,7 +1106,7 @@ function leaveMode(name, notify) {
 
 const PRESETS = [
   { id: 'sign', chip: '簽名', make: () => ({
-      kind: 'sign', name: state.signName, dateText: state.roc,
+      kind: 'sign', name: state.signName, dateText: state.signDate,
       nameSize: 22, dateSize: 12, gap: 6, align: 'center', layout: 'stack' }) },
   // 自由文字：沒有日期、可以換行。原本的「僅簽名」與「無關」都是它的特例，
   // 預設帶上一次寫過的內容（第一次是「無關」）
@@ -1123,15 +1124,15 @@ function renderChips() {
     b.setAttribute('aria-pressed', String(state.preset === p.id));
     b.onclick = () => {
       state.preset = p.id;
-      const preset = p.make();
       // 有選取中的戳章就一起套用，符合「按了就看到變化」的預期。
-      // 但換模式不該把已經寫好的字弄丟，空白的才吃範本帶來的預設內容。
+      // 簽名和文字是兩條線：先把這個戳章目前的字（和日期）記到它那一邊，
+      // 再換上另一邊記著的，切回來時原本寫的還在。
       const m = state.marks[state.sel];
-      if (m && m.name) preset.name = m.name;
+      if (m) remember(m);
+      const preset = p.make();
       state.tpl = { ...state.tpl, ...preset };
       if (m) {
         Object.assign(m, preset);
-        rememberName(m);
         select(state.sel);
         state.preset = p.id;   // select() 不會動 preset，但編輯欄位會，這裡固定回來
       }
@@ -1358,13 +1359,15 @@ function renderList() {
 const TPL_KEYS = ['kind','name','dateText','nameSize','dateSize','gap','align','layout'];
 
 // 簽名與自由文字各記各的，切回去時不會撿到另一邊的字
-function rememberName(m) {
-  if (m.kind === 'text') state.freeText = m.name; else state.signName = m.name;
+function remember(m) {
+  if (m.kind === 'text') { state.freeText = m.name; return; }
+  state.signName = m.name;
+  state.signDate = m.dateText;
 }
 
 function syncTpl(m) {
   TPL_KEYS.forEach(k => state.tpl[k] = m[k]);
-  rememberName(m);
+  remember(m);
   state.preset = null;
   renderChips();
 }

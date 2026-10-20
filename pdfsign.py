@@ -10,6 +10,7 @@
     然後瀏覽 http://<ip>
 """
 
+import asyncio
 import importlib.util
 import io
 import json
@@ -23,7 +24,8 @@ from functools import lru_cache
 from pathlib import Path
 
 import pymupdf
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
@@ -37,6 +39,12 @@ FONT_CANDIDATES = [
 
 PORT = int(os.environ.get("PDFSIGN_PORT", "80"))
 RENDER_ZOOM = 2.0
+
+# 同時算幾頁圖。MuPDF 算圖時一直抓著 Python 的 GIL，不管開幾個都是一頁一頁輪流算，
+# 開多了不會比較快，只會讓別人的請求一起卡住、記憶體一起疊上去。
+# 實測 12 頁重頁面：上限 5 跟 1 都是每頁約 2.3 秒，但同時間別人按個按鈕，
+# 上限 5 要等 9～14 秒，上限 1 約 2 秒。512MB 的容器也曾因此一路推進 swap 被 OOM 砍掉
+RENDER_SLOTS = max(1, int(os.environ.get("PDFSIGN_RENDER_SLOTS", "1")))
 
 # 自由文字換行時的行距倍率。前端 LINE_FACTOR 要跟著一樣，
 # 不然畫面上看到的行距會跟輸出的 PDF 對不起來。
@@ -108,7 +116,7 @@ except ImportError:  # 沒裝也能跑，只是會退回送整支字型
 SEED_CHARS = (
     "簽章工具名日期無關僅對齊左緣置中右下方同行大小刪除這個下載好的換一份頁"
     "民國年月未填在上點一次就會放個開啟可選取搜尋文字不是圖片把檔案拖到裡"
-    "內容"
+    "內容面入，全部停止剩（）"
     "或選擇還沒有蓋任何請確認後端狀態與網路連線重試產生失敗已"
     "0123456789/.:-"
 )
@@ -235,16 +243,37 @@ async def upload(file: UploadFile = File(...)):
     return {"doc": doc_id, "name": file.filename, "pages": pages}
 
 
-@app.get("/api/page/{doc_id}/{index}")
-def page_image(doc_id: str, index: int):
-    doc = pymupdf.open(doc_path(doc_id))
-    if not 0 <= index < doc.page_count:
-        doc.close()
-        raise HTTPException(404, "頁碼超出範圍")
+def release_store() -> None:
+    """清空 MuPDF 的快取。
 
-    pix = doc[index].get_pixmap(matrix=pymupdf.Matrix(RENDER_ZOOM, RENDER_ZOOM))
-    png = pix.tobytes("png")
-    doc.close()
+    它預設可以長到 256MB，小容器裡光它就佔掉一半。每個請求都重開一次文件，
+    換了文件物件快取就對不上，留著幾乎沒用，只是把記憶體壓在那裡。"""
+    pymupdf.TOOLS.store_shrink(100)
+
+
+def render_page(path: Path, index: int) -> bytes:
+    doc = pymupdf.open(path)
+    try:
+        if not 0 <= index < doc.page_count:
+            raise HTTPException(404, "頁碼超出範圍")
+        pix = doc[index].get_pixmap(matrix=pymupdf.Matrix(RENDER_ZOOM, RENDER_ZOOM))
+        return pix.tobytes("png")
+    finally:
+        doc.close()
+        release_store()
+
+
+_render_slots = asyncio.Semaphore(RENDER_SLOTS)
+
+
+@app.get("/api/page/{doc_id}/{index}")
+async def page_image(doc_id: str, index: int, request: Request):
+    path = doc_path(doc_id)
+    async with _render_slots:
+        # 排到的時候人可能已經走了（關分頁、按刪除、捲過去了），就不用算
+        if await request.is_disconnected():
+            return Response(status_code=204)
+        png = await run_in_threadpool(render_page, path, index)
     return Response(png, media_type="image/png",
                     headers={"Cache-Control": "public, max-age=3600"})
 
@@ -342,6 +371,7 @@ def sign(req: SignRequest):
     out = io.BytesIO()
     doc.save(out, garbage=4, deflate=True, use_objstms=1)
     doc.close()
+    release_store()
 
     return Response(
         out.getvalue(),
@@ -566,6 +596,26 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   transition: border-color .15s, background .15s;
 }
 .drop.over { border-color: var(--seal); background: var(--seal-wash); }
+.drop.busy { border-style: solid; }
+
+/* 選了檔案之後的進度：大檔案光上傳就要一陣子，沒有回饋會以為沒反應 */
+.up {
+  margin-top: 1.1rem;
+  font-size: .85rem;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+.up-track {
+  height: 4px;
+  margin-top: .45rem;
+  background: var(--desk-deep);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.up-bar { height: 100%; width: 0; background: var(--seal); transition: width .2s; }
+/* 上傳完、伺服器在讀檔：不知道要多久，就讓整條慢慢閃 */
+.up-bar.waiting { animation: up-pulse 1.2s ease-in-out infinite; }
+@keyframes up-pulse { 50% { opacity: .35; } }
 
 /* 拖檔進來時整個視窗都是放置區，這層只是視覺提示 */
 body.dropping::after {
@@ -610,6 +660,27 @@ body.dropping::after {
   pointer-events: none;
 }
 .sheet.failed::after { content: '這一頁載入失敗'; color: var(--seal); }
+.sheet .retry {
+  display: none;
+  position: absolute;
+  left: 50%; top: calc(50% + 1.75rem);
+  transform: translateX(-50%);
+  z-index: 1;
+  font-size: .85rem;
+  padding: .3rem 1rem;
+}
+.sheet.failed .retry { display: block; }
+
+/* 載入全部：確定沒人在用的時候才按，固定在左下角 */
+.load-all {
+  position: fixed;
+  left: 1rem; bottom: 1rem;
+  z-index: 30;
+  font-size: .82rem;
+  padding: .35rem .85rem;
+  box-shadow: 0 1px 2px rgba(0,0,0,.10), 0 4px 14px rgba(0,0,0,.08);
+  font-variant-numeric: tabular-nums;
+}
 
 /* 頁面還沒載完的提示：黏在可視範圍底部，不擋點擊 */
 .load-pill {
@@ -830,7 +901,7 @@ body.mode-on .empty { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  * { transition: none !important; }
+  * { transition: none !important; animation: none !important; }
 }
 </style>
 </head>
@@ -844,9 +915,14 @@ body.mode-on .empty { display: none; }
       <div class="drop" id="drop">
         <button class="primary" id="pick">選擇 PDF</button>
         <p style="margin:.9rem 0 0;font-size:.85rem;color:var(--ink-faint)">或把檔案拖進視窗任何地方</p>
+        <div class="up" id="upStatus" role="status" hidden>
+          <div id="upText"></div>
+          <div class="up-track"><div class="up-bar" id="upBar"></div></div>
+        </div>
       </div>
     </div>
   </main>
+  <button class="load-all" id="loadAll" hidden>載入全部頁面</button>
 
   <aside class="panel" id="panel" hidden>
     <div class="panel-head">
@@ -942,7 +1018,7 @@ function endDrag() {
 }
 
 document.addEventListener('dragenter', e => {
-  if (!isFileDrag(e) || state.doc) return;
+  if (!isFileDrag(e) || state.doc || uploading) return;
   e.preventDefault();
   if (++dragDepth === 1) {
     document.body.classList.add('dropping');
@@ -954,7 +1030,7 @@ document.addEventListener('dragenter', e => {
 document.addEventListener('dragover', e => {
   if (!isFileDrag(e)) return;
   e.preventDefault();
-  e.dataTransfer.dropEffect = state.doc ? 'none' : 'copy';
+  e.dataTransfer.dropEffect = state.doc || uploading ? 'none' : 'copy';
 });
 
 document.addEventListener('dragleave', e => {
@@ -966,7 +1042,7 @@ document.addEventListener('drop', e => {
   if (!isFileDrag(e)) return;   // 拖文字到輸入框之類的，讓瀏覽器自己處理
   e.preventDefault();
   endDrag();
-  if (state.doc) return;        // 已經開著一份，不讓拖放把它蓋掉
+  if (state.doc || uploading) return;   // 已經開著一份（或正在上傳），不讓拖放把它蓋掉
   const f = e.dataTransfer.files[0];
   if (!f) return;
   // 某些系統拖過來的 type 是空的，退回看副檔名
@@ -974,16 +1050,54 @@ document.addEventListener('drop', e => {
   else toast('只能開啟 PDF');
 });
 
-async function load(file) {
-  const fd = new FormData();
-  fd.append('file', file);
-  let r;
-  try {
-    r = await fetch('/api/upload', { method: 'POST', body: fd });
-  } catch { return toast('連不上服務'); }
-  if (!r.ok) return toast((await r.json()).detail || '開啟失敗');
+let uploading = false;
 
-  const data = await r.json();
+// fetch 拿不到上傳進度，只好用 XHR
+function upload(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/upload');
+    xhr.responseType = 'json';
+    xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+    xhr.upload.onload = () => onProgress(1);
+    xhr.onload = () => resolve({ ok: xhr.status >= 200 && xhr.status < 300, data: xhr.response || {} });
+    xhr.onerror = xhr.onabort = () => reject();
+    const fd = new FormData();
+    fd.append('file', file);
+    xhr.send(fd);
+  });
+}
+
+// frac 是 0～1 的上傳進度；null 表示傳完了在等伺服器讀檔。text 為 null 就收起來
+function upStatus(text, frac) {
+  const busy = text != null;
+  $('#upStatus').hidden = !busy;
+  drop.classList.toggle('busy', busy);
+  $('#pick').disabled = busy;
+  if (!busy) return;
+  $('#upText').textContent = text;
+  $('#upBar').style.width = (frac == null ? 100 : frac * 100) + '%';
+  $('#upBar').classList.toggle('waiting', frac == null);
+}
+
+async function load(file) {
+  if (uploading) return;
+  uploading = true;
+  const mb = n => (n / 2 ** 20).toFixed(file.size < 10 * 2 ** 20 ? 1 : 0);
+  upStatus(`上傳中 0%（0 / ${mb(file.size)} MB）`, 0);
+  let r = null;
+  try {
+    r = await upload(file, f => {
+      if (f < 1) upStatus(`上傳中 ${Math.floor(f * 100)}%（${mb(file.size * f)} / ${mb(file.size)} MB）`, f);
+      else upStatus('讀取 PDF 中…請稍候', null);
+    });
+  } catch {}
+  uploading = false;
+  $('#file').value = '';        // 同一個檔案失敗後還能再選一次
+  if (!r) { upStatus(null); return toast('連不上服務'); }
+  if (!r.ok) { upStatus(null); return toast(r.data.detail || '開啟失敗'); }
+
+  const data = r.data;
   if (MODE.name) leaveMode(MODE.name, true);   // 換文件，上一份開著的模式收掉
   state.doc = data.doc;
   state.pages = data.pages;
@@ -1008,24 +1122,132 @@ async function load(file) {
 // ---------- 頁面 ----------
 
 let renderGen = 0;
+let pageWatch = null;
+
+// 頁面圖捲到附近才跟伺服器要。一打開就要全部的話，幾百頁的 PDF 會讓伺服器
+// 一頁一頁算到底，CPU 跟記憶體都被同一個人佔走（曾經因此被 OOM 砍掉）。
+// 上下各多抓一個半畫面，正常捲動不會看到空白頁
+const PRELOAD = '150% 0px';
+const BULK_INFLIGHT = 2;
 
 function renderPages() {
   const stage = $('#stage');
   stage.innerHTML = '';
+  if (pageWatch) pageWatch.disconnect();
 
-  // 頁數多的時候圖要一陣子才回得來，捲到已載入的最後一頁容易以為到底了，
-  // 所以在底部掛一個「後面還有」的提示，全部回來才拿掉
+  // 已經跟伺服器要了、還沒回來的頁。全部到了就把底部的提示收掉
   const gen = ++renderGen;
+  const doc = state.doc;
   const total = state.pages.length;
+  const sheets = [];
+  const waiting = new Set();
+  const near = new Set();      // 在預載範圍裡的頁
+  const tries = new Map();     // 每頁失敗過幾次
+  const cooling = new Set();   // 失敗後等著自動重試的頁
   let done = 0;
+  let bulk = false;            // 「載入全部」開著
   const pill = document.createElement('div');
   pill.className = 'load-pill';
   pill.setAttribute('role', 'status');
+  const allBtn = $('#loadAll');
+
   const tick = () => {
     if (gen !== renderGen) return;      // 換了文件，舊頁的圖晚到不算
-    pill.textContent = `後面還有頁面，載入中 ${done} / ${total}`;
-    pill.hidden = done >= total;
-    document.body.classList.toggle('pages-loading', done < total);
+    pump();
+    // 要得到的都要過了，剩下的都失敗了：載入全部到此為止
+    if (bulk && !waiting.size && !cooling.size) bulk = false;
+    const left = total - done;
+    const broken = sheets.filter(s => s.classList.contains('failed')).length;
+    // 載入全部的時候進度看按鈕，底部提示就不用一直掛著
+    pill.textContent = `頁面載入中，還有 ${waiting.size} 頁`;
+    pill.hidden = !waiting.size || bulk;
+    document.body.classList.toggle('pages-loading', !pill.hidden);
+    allBtn.hidden = !left;
+    allBtn.textContent = bulk ? `停止載入（還剩 ${left} 頁）`
+                       : broken === left ? `重試失敗的 ${left} 頁` : '載入全部頁面';
+  };
+
+  // 載入全部：照頁序把還沒載的頁要回來，但一次只放 BULK_INFLIGHT 頁出去。
+  // 伺服器一次只算得了一頁，別人的請求頂多排在這幾頁後面
+  const pump = () => {
+    if (!bulk) return;
+    for (const sheet of sheets) {
+      if (waiting.size >= BULK_INFLIGHT) break;
+      if (sheet.classList.contains('loading') && !cooling.has(sheet)
+          && !sheet.querySelector('img').hasAttribute('src')) request(sheet);
+    }
+  };
+
+  allBtn.onclick = () => {
+    bulk = !bulk;
+    if (bulk) {
+      // 之前放棄的頁也再試一輪
+      sheets.forEach(sheet => {
+        if (sheet.classList.contains('failed')) {
+          tries.delete(sheet);
+          sheet.classList.replace('failed', 'loading');
+        }
+      });
+    }
+    tick();
+  };
+
+  const watch = pageWatch = new IntersectionObserver(entries => {
+    entries.forEach(({ target: sheet, isIntersecting }) => {
+      const img = sheet.querySelector('img');
+      if (isIntersecting) {
+        near.add(sheet);
+        if (!img.hasAttribute('src') && !cooling.has(sheet)) request(sheet);
+      } else {
+        near.delete(sheet);
+        if (waiting.has(sheet) && !bulk) {
+          // 還沒回來就捲走了：拿掉 src 讓瀏覽器斷線，伺服器還在排隊的就不會算
+          img.removeAttribute('src');
+          waiting.delete(sheet);
+        }
+      }
+    });
+    tick();
+  }, { root: stage, rootMargin: PRELOAD });
+
+  const request = sheet => {
+    const n = tries.get(sheet) || 0;
+    // 重試時換個網址，免得瀏覽器把快取裡失敗的那次直接拿回來
+    sheet.querySelector('img').src =
+      `/api/page/${doc}/${sheet.dataset.page}` + (n ? `?retry=${n}` : '');
+    sheet.classList.replace('failed', 'loading');
+    waiting.add(sheet);
+  };
+
+  // 到了就不用再盯著這頁
+  const loaded = sheet => {
+    sheet.classList.remove('loading', 'failed');
+    waiting.delete(sheet);
+    tries.delete(sheet);
+    watch.unobserve(sheet);
+    done++;
+    tick();
+  };
+
+  // 沒拿到：自己再試兩次；還是不行就標成失敗，可以按「重試」，捲走再回來也會再要一次
+  const failed = sheet => {
+    const img = sheet.querySelector('img');
+    img.removeAttribute('src');          // 不然會留著破圖示和替代文字
+    waiting.delete(sheet);
+    const n = (tries.get(sheet) || 0) + 1;
+    tries.set(sheet, n);
+    if (n <= 2) {
+      cooling.add(sheet);
+      setTimeout(() => {
+        cooling.delete(sheet);
+        if (gen !== renderGen || img.hasAttribute('src')) return;
+        if (near.has(sheet) || bulk) request(sheet);
+        tick();
+      }, 1000 * n);
+    } else {
+      sheet.classList.replace('loading', 'failed');
+    }
+    tick();
   };
 
   state.pages.forEach((pg, i) => {
@@ -1043,10 +1265,16 @@ function renderPages() {
     const img = document.createElement('img');
     img.alt = `第 ${i + 1} 頁`;
     img.draggable = false;
-    img.onload = () => { sheet.classList.remove('loading'); done++; tick(); };
-    img.onerror = () => { sheet.classList.replace('loading', 'failed'); done++; tick(); };
-    img.src = `/api/page/${state.doc}/${i}`;
+    img.onload = () => loaded(sheet);
+    // 捲走時拿掉 src 也可能觸發 error，那不算失敗
+    img.onerror = () => { if (img.hasAttribute('src')) failed(sheet); };
     sheet.appendChild(img);
+
+    const retry = document.createElement('button');
+    retry.className = 'retry';
+    retry.textContent = '重試';
+    retry.onclick = e => { e.stopPropagation(); request(sheet); tick(); };
+    sheet.appendChild(retry);
 
     sheet.addEventListener('click', e => {
       // 拖曳戳章時若在空白處放開，click 會派給 sheet，必須擋掉
@@ -1067,6 +1295,8 @@ function renderPages() {
     });
 
     stage.appendChild(sheet);
+    sheets.push(sheet);
+    watch.observe(sheet);
   });
   stage.appendChild(pill);
   tick();

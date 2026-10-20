@@ -95,6 +95,9 @@ WorkingDirectory=$DIR
 # 暫存的 PDF 放 /var/lib/pdfsign；systemd 會建好目錄並把路徑放進 STATE_DIRECTORY
 StateDirectory=pdfsign
 Environment=PDFSIGN_PORT=$PORT
+# glibc 預設每個執行緒都可能開一塊自己的記憶體池，算圖的執行緒一多，
+# 用完的記憶體散在各池裡還不回去。小容器裡壓到 2 個池，閒下來才降得下來
+Environment=MALLOC_ARENA_MAX=2
 ExecStart=$DIR/venv/bin/python $DIR/pdfsign.py
 Restart=on-failure
 RestartSec=5

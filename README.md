@@ -252,6 +252,7 @@ journalctl -u pdfsign -n 50
 | `PDFSIGN_WORK_DIR` | `/var/lib/pdfsign` | 上傳檔的暫存目錄 |
 | `PDFSIGN_TTL_DAYS` | `7` | 暫存檔保留幾天 |
 | `PDFSIGN_PLUGIN_DIR` | 程式旁的 `plugins/` | 外掛目錄 |
+| `PDFSIGN_RENDER_SLOTS` | `1` | 同時算幾頁預覽圖。MuPDF 算圖時會鎖住整個程序，開多了不會比較快，只會讓其他人的操作等更久、記憶體高峰更高，一般不用改 |
 
 ---
 

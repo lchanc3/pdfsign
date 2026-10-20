@@ -213,33 +213,57 @@ def doc_path(doc_id: str) -> Path:
 # ---------------------------------------------------------------- API
 
 
-@app.post("/api/upload")
-async def upload(file: UploadFile = File(...)):
-    raw = await file.read()
-    try:
-        doc = pymupdf.open(stream=raw, filetype="pdf")
-    except Exception:
-        raise HTTPException(400, "這不是可讀取的 PDF")
+def save_upload(src, dest: Path) -> list[dict]:
+    """把上傳的檔案一段一段寫進暫存目錄，再從硬碟上打開檢查、量頁面大小。
 
-    if doc.page_count == 0:
-        raise HTTPException(400, "這份 PDF 沒有任何頁面")
+    以前是整份讀進記憶體再解析、再寫檔，100MB 的掃描檔會在記憶體裡同時放好幾份，
+    小容器光上傳一次就多吃兩百多 MB。不是 PDF 或沒有頁面就把寫進去的檔刪掉。"""
 
-    sweep()
+    def discard() -> None:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:  # 刪不掉就留給 sweep，不要因此把錯誤訊息換成 500
+            pass
 
-    doc_id = str(uuid.uuid4())
     try:
         # 目錄仍可能被人為刪掉或掛載點跑掉，寫之前先確保它在
         WORK_DIR.mkdir(parents=True, exist_ok=True)
-        (WORK_DIR / f"{doc_id}.pdf").write_bytes(raw)
+        with open(dest, "wb") as out:
+            shutil.copyfileobj(src, out, 1024 * 1024)
     except OSError as e:
+        discard()
         raise HTTPException(500, f"暫存檔寫入失敗：{e.strerror or e}")
 
-    pages = [
-        {"width": round(p.rect.width, 2), "height": round(p.rect.height, 2)}
-        for p in doc
-    ]
-    doc.close()
+    # 開檔失敗時，例外的 traceback 還抓著 MuPDF 的檔案串流，Windows 上在 except
+    # 裡面刪不掉。離開 except、例外放掉之後再刪
+    doc = None
+    try:
+        doc = pymupdf.open(dest, filetype="pdf")
+    except Exception:
+        pass
+    if doc is None:
+        discard()
+        raise HTTPException(400, "這不是可讀取的 PDF")
+    try:
+        pages = [
+            {"width": round(p.rect.width, 2), "height": round(p.rect.height, 2)}
+            for p in doc
+        ]
+    finally:
+        doc.close()       # 一樣，開著的檔在 Windows 上刪不掉，先關
+        release_store()
+    if not pages:
+        discard()
+        raise HTTPException(400, "這份 PDF 沒有任何頁面")
+    return pages
 
+
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...)):
+    sweep()
+    doc_id = str(uuid.uuid4())
+    # 寫檔和解析都會卡住，丟到執行緒裡做，別讓整個服務等它
+    pages = await run_in_threadpool(save_upload, file.file, WORK_DIR / f"{doc_id}.pdf")
     return {"doc": doc_id, "name": file.filename, "pages": pages}
 
 

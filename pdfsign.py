@@ -1012,13 +1012,34 @@ body.mode-on .empty { display: none; }
 
 <script>
 const $ = s => document.querySelector(s);
+
+// 版面（大小、對齊、日期在下方或同行）簽名與文字各記各的，存在瀏覽器裡，
+// 重新整理、換一份檔案都沿用上次的
+const STYLE_KEYS = ['nameSize','dateSize','gap','align','layout'];
+const STYLE_DEFAULT = {
+  sign: { nameSize: 22, dateSize: 12, gap: 6, align: 'center', layout: 'stack' },
+  text: { nameSize: 20, dateSize: 12, gap: 6, align: 'center', layout: 'stack' }
+};
+function loadStyles() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem('pdfsign.style')) || {}; } catch {}
+  const out = {};
+  for (const kind in STYLE_DEFAULT) {
+    out[kind] = { ...STYLE_DEFAULT[kind] };
+    STYLE_KEYS.forEach(k => {
+      if (saved[kind] && typeof saved[kind][k] === typeof out[kind][k]) out[kind][k] = saved[kind][k];
+    });
+  }
+  return out;
+}
+
 const state = {
   doc: null, pages: [], marks: [], sel: -1, roc: '', preset: 'sign', dragging: false,
   // 簽名與自由文字各記各的，切換模式時不會互相蓋掉；簽名的日期改過也記著
   signName: '', signDate: '', freeText: '無關',
-  tpl: { kind: 'sign', name: '', dateText: '', nameSize: 22, dateSize: 12,
-         gap: 6, align: 'center', layout: 'stack' }
+  style: loadStyles()
 };
+state.tpl = { kind: 'sign', name: '', dateText: '', ...state.style.sign };
 
 // 換行的行距倍率，跟後端的 LINE_FACTOR 必須一致
 const LINE_FACTOR = 1.3;
@@ -1361,12 +1382,12 @@ function leaveMode(name, notify) {
 const PRESETS = [
   { id: 'sign', chip: '簽名', make: () => ({
       kind: 'sign', name: state.signName, dateText: state.signDate,
-      nameSize: 22, dateSize: 12, gap: 6, align: 'center', layout: 'stack' }) },
+      ...state.style.sign }) },
   // 自由文字：沒有日期、可以換行。原本的「僅簽名」與「無關」都是它的特例，
   // 預設帶上一次寫過的內容（第一次是「無關」）
   { id: 'text', chip: '文字', make: () => ({
       kind: 'text', name: state.freeText, dateText: '',
-      nameSize: 20, dateSize: 12, gap: 6, align: 'center', layout: 'stack' }) }
+      ...state.style.text }) }
 ];
 
 function renderChips() {
@@ -1377,19 +1398,11 @@ function renderChips() {
     b.textContent = p.chip;
     b.setAttribute('aria-pressed', String(state.preset === p.id));
     b.onclick = () => {
+      // 只決定「下一個」蓋什麼，不動已經蓋上的；選取中的戳章一併取消，
+      // 免得以為是在改它
+      if (state.sel >= 0) select(-1);
       state.preset = p.id;
-      // 有選取中的戳章就一起套用，符合「按了就看到變化」的預期。
-      // 簽名和文字是兩條線：先把這個戳章目前的字（和日期）記到它那一邊，
-      // 再換上另一邊記著的，切回來時原本寫的還在。
-      const m = state.marks[state.sel];
-      if (m) remember(m);
-      const preset = p.make();
-      state.tpl = { ...state.tpl, ...preset };
-      if (m) {
-        Object.assign(m, preset);
-        select(state.sel);
-        state.preset = p.id;   // select() 不會動 preset，但編輯欄位會，這裡固定回來
-      }
+      state.tpl = { ...state.tpl, ...p.make() };
       renderChips();
       refreshFont();
       drawMarks();
@@ -1614,6 +1627,9 @@ const TPL_KEYS = ['kind','name','dateText','nameSize','dateSize','gap','align','
 
 // 簽名與自由文字各記各的，切回去時不會撿到另一邊的字
 function remember(m) {
+  const style = state.style[m.kind];
+  STYLE_KEYS.forEach(k => style[k] = m[k]);
+  try { localStorage.setItem('pdfsign.style', JSON.stringify(state.style)); } catch {}
   if (m.kind === 'text') { state.freeText = m.name; return; }
   state.signName = m.name;
   state.signDate = m.dateText;

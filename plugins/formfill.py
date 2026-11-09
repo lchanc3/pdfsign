@@ -545,7 +545,8 @@ function fill(h, when) {
       kind: 'text', name: text, dateText: '',
       nameSize: fit(text, s.size, s.gap), dateSize: 12, gap: 6,
       align: s.align, layout: 'stack',
-      ffHit: h.id,        // 後端的 Placement 會忽略這個多出來的欄位
+      ffHit: h.id,        // 後端的 Placement 會忽略這兩個多出來的欄位
+      fromPlugin: true,   // 改這格不會變成之後戳章的範本或記住的版面
     });
   });
   h.done = true;

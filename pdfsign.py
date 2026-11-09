@@ -1636,6 +1636,9 @@ function remember(m) {
 }
 
 function syncTpl(m) {
+  // 外掛產生的戳章（例如填表填進格子裡的字）字級與對齊是照欄位來的，
+  // 改它不代表想讓下一個戳章、或下次打開時的「文字」都長這樣
+  if (m.fromPlugin) return;
   TPL_KEYS.forEach(k => state.tpl[k] = m[k]);
   remember(m);
   state.preset = null;

@@ -79,6 +79,19 @@ def find_work_dir() -> Path:
 
 WORK_DIR = find_work_dir()
 
+# 上傳的檔案超過 1MB 時，Starlette 會先寫進系統暫存目錄，處理函式才拿得到。
+# 新版 Debian 的 /tmp 是 tmpfs，寫在那裡等於整份檔案又放回記憶體裡，
+# 小容器上傳大檔照樣會被擠爆。改到暫存目錄底下，跟上傳的 PDF 同一顆硬碟。
+# 程序剛啟動時不會有上傳在進行，裡面剩的都是上次被砍掉時留下的，清掉
+UPLOAD_TMP = WORK_DIR / "upload-tmp"
+UPLOAD_TMP.mkdir(exist_ok=True)
+for _leftover in UPLOAD_TMP.iterdir():
+    try:
+        _leftover.unlink()
+    except OSError:
+        pass
+tempfile.tempdir = str(UPLOAD_TMP)
+
 
 def find_font() -> str:
     override = os.environ.get("PDFSIGN_FONT")
@@ -156,6 +169,15 @@ def webfont(chars: str) -> bytes:
     return subset_font(FONT_PATH, chars or SEED_CHARS)
 
 app = FastAPI(title="簽章工具")
+
+
+@app.middleware("http")
+async def ensure_upload_tmp(request: Request, call_next):
+    # 上傳的檔案在進到 upload() 之前就寫進 UPLOAD_TMP 了，那邊補建目錄來不及。
+    # 暫存目錄被人刪掉的話，在這裡先補回來，不然之後上傳大檔都是 500
+    if request.url.path == "/api/upload":
+        UPLOAD_TMP.mkdir(parents=True, exist_ok=True)
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------- 資料模型
